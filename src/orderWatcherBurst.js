@@ -41,6 +41,7 @@ async function getTradesToSync(limit = 20) {
     SELECT id, symbol, side, status,
            entry_price,
            quantity, stop_loss, take_profit,
+           initial_sl,
            entry_order_id, entry_client_order_id,
            sl_order_id, sl_client_order_id,
            tp_order_id, tp_client_order_id
@@ -61,6 +62,7 @@ async function getTradesToSync(limit = 20) {
     quantity: r.quantity == null ? null : Number(r.quantity),
     stop_loss: r.stop_loss == null ? null : Number(r.stop_loss),
     take_profit: r.take_profit == null ? null : Number(r.take_profit),
+    initial_sl: r.initial_sl == null ? null : Number(r.initial_sl),
     // IMPORTANT: Binance orderId can exceed JS Number safe range. Keep as string.
     entry_order_id: r.entry_order_id == null ? null : String(r.entry_order_id),
     entry_client_order_id: r.entry_client_order_id ?? null,
@@ -195,39 +197,51 @@ async function placeOrUpdateStopLoss({ tr, stopPrice, now, reason }) {
 async function closeNowAtMarket(tr, reason, price) {
   const now = Date.now();
 
-  // 1) First: mark CLOSED in DB no matter what (so we don't miss TP/SL due to API issues)
+  // IMPORTANT: close on exchange FIRST, then mark DB CLOSED.
+  // If we mark DB CLOSED first and the exchange call fails, we can end up with a naked position
+  // that the watcher never manages again.
+
+  let closeOk = !tradingEnabled;
+
+  // 1) Best-effort exchange cleanup/close (only if enabled)
+  if (tradingEnabled) {
+    try { await cancelIfExists(tr.symbol, tr.sl_order_id, tr.sl_client_order_id); } catch {}
+    try { await cancelIfExists(tr.symbol, tr.tp_order_id, tr.tp_client_order_id); } catch {}
+    try { await cancelIfExists(tr.symbol, tr.entry_order_id, tr.entry_client_order_id); } catch {}
+
+    if (tr.quantity) {
+      try {
+        await placeFuturesMarketOrder({
+          symbol: tr.symbol,
+          side: tr.side === 'LONG' ? 'SELL' : 'BUY',
+          // In One-way mode we must not send positionSide; trade client will strip it anyway.
+          positionSide: null,
+          quantity: tr.quantity,
+          // Prefer reduceOnly for safety; if an account rejects it, binanceTradeClient only sends when not null.
+          reduceOnly: true,
+        });
+        closeOk = true;
+      } catch (err) {
+        logger.warn({ err, id: tr.id, symbol: tr.symbol }, 'Market close failed; keeping trade ACTIVE to retry next tick');
+        closeOk = false;
+      }
+    } else {
+      // No qty known => can't close safely.
+      closeOk = false;
+    }
+  } else {
+    logger.warn({ id: tr.id, symbol: tr.symbol }, 'TRADING_ENABLED!=1, skipping exchange cancel/market-close');
+  }
+
+  if (!closeOk) return;
+
+  // 2) Then: mark CLOSED in DB
   await pool.query(
     `UPDATE open_trades
      SET status='CLOSED', closed_at=:now, notes=:notes
      WHERE id=:id AND status='ACTIVE'`,
     { id: tr.id, now, notes: `${reason} @${price ?? 'NA'}`.slice(0, 255) },
   );
-
-  // 2) Then: best-effort exchange cleanup/close (only if enabled)
-  if (!tradingEnabled) {
-    logger.warn({ id: tr.id, symbol: tr.symbol }, 'TRADING_ENABLED!=1, skipping exchange cancel/market-close');
-    return;
-  }
-
-  try { await cancelIfExists(tr.symbol, tr.sl_order_id, tr.sl_client_order_id); } catch {}
-  try { await cancelIfExists(tr.symbol, tr.tp_order_id, tr.tp_client_order_id); } catch {}
-  try { await cancelIfExists(tr.symbol, tr.entry_order_id, tr.entry_client_order_id); } catch {}
-
-  if (tr.quantity) {
-    try {
-      await placeFuturesMarketOrder({
-        symbol: tr.symbol,
-        side: tr.side === 'LONG' ? 'SELL' : 'BUY',
-        // In One-way mode we must not send positionSide; trade client will strip it anyway.
-        positionSide: null,
-        quantity: tr.quantity,
-        // Prefer reduceOnly for safety; if an account rejects it, binanceTradeClient only sends when not null.
-        reduceOnly: true,
-      });
-    } catch (err) {
-      logger.warn({ err, id: tr.id, symbol: tr.symbol }, 'Market close failed (ignored)');
-    }
-  }
 }
 
 async function syncOne(tr) {
@@ -508,15 +522,17 @@ async function syncOne(tr) {
       if (Number.isFinite(entry) && Number.isFinite(slNow)) {
         // initialize state (watermarks) for this trade id
         if (!trailState.has(tr.id)) {
-          const R0 = tr.side === 'LONG' ? (entry - slNow) : (slNow - entry);
+          const baseSl = tr.initial_sl != null ? Number(tr.initial_sl) : slNow;
+          const R0 = tr.side === 'LONG' ? (entry - baseSl) : (baseSl - entry);
           if (!Number.isFinite(R0) || R0 <= 0) {
-            // can't compute R, skip
-            // (this can happen if SL got set on the wrong side due to bad data)
+            // can't compute R
+            // - can happen if baseSl == entry (e.g., BE already moved before restart)
+            // - or if SL got set on wrong side due to bad data
             return;
           }
           trailState.set(tr.id, {
             entry,
-            initialSl: slNow,
+            initialSl: baseSl,
             R: R0,
             highWater: null,
             lowWater: null,

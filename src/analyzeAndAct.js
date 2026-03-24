@@ -26,21 +26,24 @@ function sideHitSlTp({ side, price, sl, tp }) {
 }
 
 function trendLabel({ close, ma20, ma50, rsi }) {
+  // Hysteresis around RSI=50 to reduce flicker during normal pullbacks.
+  // (Avoid turning an obvious trend into NEUTRAL just because RSI is 48-49.)
   if (ma20 == null || ma50 == null || rsi == null) return 'NEUTRAL';
-  if (close > ma50 && ma20 > ma50 && rsi >= 50) return 'BULL';
-  if (close < ma50 && ma20 < ma50 && rsi <= 50) return 'BEAR';
+  if (close > ma50 && ma20 > ma50 && rsi >= 45) return 'BULL';
+  if (close < ma50 && ma20 < ma50 && rsi <= 55) return 'BEAR';
   return 'NEUTRAL';
 }
 
 function structureBreak({ tradeSide, htf }) {
   // Strict definition to avoid over-reacting.
+  // Note: RSI 45/55 was too sensitive and could trigger closes on normal pullbacks.
   const { close, ma20, ma50, rsi } = htf;
   if (ma20 == null || ma50 == null || rsi == null) return false;
 
   if (tradeSide === 'LONG') {
-    return close < ma50 && ma20 < ma50 && rsi < 45;
+    return close < ma50 && ma20 < ma50 && rsi < 40;
   }
-  return close > ma50 && ma20 > ma50 && rsi > 55;
+  return close > ma50 && ma20 > ma50 && rsi > 60;
 }
 
 async function getCandles(symbol, interval, limit = 260) {
@@ -210,17 +213,31 @@ function reversalConfirmForContinuation({ bias, candles15m, candles30m, candles1
   // We use the last completed candles on 15m/30m/1h.
   // Goal: after a stop-out, require a clear reversal candle back in the HTF direction
   // to avoid immediate re-entry in the same choppy zone.
-  const m15 = candles15m?.length >= 2 ? candles15m[candles15m.length - 1] : null;
-  const m15Prev = candles15m?.length >= 3 ? candles15m[candles15m.length - 2] : null;
-  const m30 = candles30m?.length >= 2 ? candles30m[candles30m.length - 1] : null;
-  const m30Prev = candles30m?.length >= 3 ? candles30m[candles30m.length - 2] : null;
-  const h1 = candles1h?.length >= 2 ? candles1h[candles1h.length - 1] : null;
-  const h1Prev = candles1h?.length >= 3 ? candles1h[candles1h.length - 2] : null;
+  //
+  // NOTE: Only checking the very last candle is too strict; we look back a few candles.
+  const m15c = candles15m?.slice(-4) ?? [];
+  const m30c = candles30m?.slice(-4) ?? [];
+  const h1c = candles1h?.slice(-4) ?? [];
+
+  const m15 = m15c.at(-1) ?? null;
+  const m15Prev = m15c.at(-2) ?? null;
+  const m15Prev2 = m15c.at(-3) ?? null;
+
+  const m30 = m30c.at(-1) ?? null;
+  const m30Prev = m30c.at(-2) ?? null;
+  const m30Prev2 = m30c.at(-3) ?? null;
+
+  const h1 = h1c.at(-1) ?? null;
+  const h1Prev = h1c.at(-2) ?? null;
+  const h1Prev2 = h1c.at(-3) ?? null;
 
   if (bias === 'SELL') {
     const bearEngulf =
+      isBearishEngulfing(m15Prev2, m15Prev) ||
       isBearishEngulfing(m15Prev, m15) ||
+      isBearishEngulfing(m30Prev2, m30Prev) ||
       isBearishEngulfing(m30Prev, m30) ||
+      isBearishEngulfing(h1Prev2, h1Prev) ||
       isBearishEngulfing(h1Prev, h1);
 
     const rejectUp = isShootingStarLike(m15) || isShootingStarLike(m30) || isShootingStarLike(h1);
@@ -229,15 +246,22 @@ function reversalConfirmForContinuation({ bias, candles15m, candles30m, candles1
       ok: bearEngulf || rejectUp,
       why: bearEngulf ? 'BEAR_ENGULF' : (rejectUp ? 'UPPER_WICK_REJECT' : 'NO_REVERSAL'),
       tf: bearEngulf
-        ? (isBearishEngulfing(m15Prev, m15) ? '15m' : (isBearishEngulfing(m30Prev, m30) ? '30m' : '1h'))
+        ? (
+          (isBearishEngulfing(m15Prev2, m15Prev) || isBearishEngulfing(m15Prev, m15))
+            ? '15m'
+            : ((isBearishEngulfing(m30Prev2, m30Prev) || isBearishEngulfing(m30Prev, m30)) ? '30m' : '1h')
+        )
         : (rejectUp ? (isShootingStarLike(m15) ? '15m' : (isShootingStarLike(m30) ? '30m' : '1h')) : null),
     };
   }
 
   if (bias === 'BUY') {
     const bullEngulf =
+      isBullishEngulfing(m15Prev2, m15Prev) ||
       isBullishEngulfing(m15Prev, m15) ||
+      isBullishEngulfing(m30Prev2, m30Prev) ||
       isBullishEngulfing(m30Prev, m30) ||
+      isBullishEngulfing(h1Prev2, h1Prev) ||
       isBullishEngulfing(h1Prev, h1);
 
     const rejectDown = isHammerLike(m15) || isHammerLike(m30) || isHammerLike(h1);
@@ -246,7 +270,11 @@ function reversalConfirmForContinuation({ bias, candles15m, candles30m, candles1
       ok: bullEngulf || rejectDown,
       why: bullEngulf ? 'BULL_ENGULF' : (rejectDown ? 'LOWER_WICK_REJECT' : 'NO_REVERSAL'),
       tf: bullEngulf
-        ? (isBullishEngulfing(m15Prev, m15) ? '15m' : (isBullishEngulfing(m30Prev, m30) ? '30m' : '1h'))
+        ? (
+          (isBullishEngulfing(m15Prev2, m15Prev) || isBullishEngulfing(m15Prev, m15))
+            ? '15m'
+            : ((isBullishEngulfing(m30Prev2, m30Prev) || isBullishEngulfing(m30Prev, m30)) ? '30m' : '1h')
+        )
         : (rejectDown ? (isHammerLike(m15) ? '15m' : (isHammerLike(m30) ? '30m' : '1h')) : null),
     };
   }
@@ -352,9 +380,10 @@ async function insertPendingTradeWithOrders({ symbol, side, entry, sl, tp, qty, 
       INSERT INTO open_trades (
         exchange,
         symbol, side, leverage, entry_price, quantity, stop_loss, take_profit,
+        initial_sl,
         status, opened_at, notes, last_sync_at
       )
-      VALUES (:exchange,:symbol,:side,:leverage,:entry,:qty,:sl,:tp,'REJECTED',:now,:notes,:now)
+      VALUES (:exchange,:symbol,:side,:leverage,:entry,:qty,:sl,:tp,:initial_sl,'REJECTED',:now,:notes,:now)
       `,
       {
         exchange: exchangeName,
@@ -365,6 +394,7 @@ async function insertPendingTradeWithOrders({ symbol, side, entry, sl, tp, qty, 
         qty,
         sl,
         tp,
+        initial_sl: sl,
         now,
         notes: `DRY_RUN AUTO_OPEN ${side}`.slice(0, 255),
       },
@@ -486,6 +516,7 @@ async function insertPendingTradeWithOrders({ symbol, side, entry, sl, tp, qty, 
     INSERT INTO open_trades (
       exchange,
       symbol, side, leverage, entry_price, quantity, stop_loss, take_profit,
+      initial_sl,
       status, opened_at, notes,
       entry_order_id, entry_client_order_id,
       sl_order_id, sl_client_order_id,
@@ -496,6 +527,7 @@ async function insertPendingTradeWithOrders({ symbol, side, entry, sl, tp, qty, 
     VALUES (
       :exchange,
       :symbol, :side, :leverage, :entry, :qty, :sl, :tp,
+      :initial_sl,
       :status, :now, :notes,
       :entry_order_id, :entry_client_order_id,
       :sl_order_id, :sl_client_order_id,
@@ -513,6 +545,7 @@ async function insertPendingTradeWithOrders({ symbol, side, entry, sl, tp, qty, 
       qty,
       sl,
       tp,
+      initial_sl: sl,
       now,
       notes: notes?.slice(0, 255) ?? null,
       status: initialStatus,
@@ -637,7 +670,10 @@ function structureLabel(candles) {
 
 function rsiDivergence({ candles, rsiArr, type }) {
   // Detect divergence based on last two swing highs/lows
+  // Guard against "micro swings" too close together (noise).
   const { highs, lows } = swingPoints(candles);
+  const minSwingGap = Math.max(1, Math.min(Number(process.env.DIV_MIN_SWING_GAP ?? 5) || 5, 50));
+
   if (type === 'BULL') {
     if (lows.length < 2) return { ok: false };
     const a = lows[lows.length - 2];
@@ -645,10 +681,13 @@ function rsiDivergence({ candles, rsiArr, type }) {
     const rA = rsiArr[a.idx];
     const rB = rsiArr[b.idx];
     if (rA == null || rB == null) return { ok: false };
+
+    const gapOk = (b.idx - a.idx) >= minSwingGap;
     // price lower low, RSI higher low
-    const ok = b.price < a.price && rB > rA;
-    return { ok, a, b, rA, rB };
+    const ok = gapOk && b.price < a.price && rB > rA;
+    return { ok, a, b, rA, rB, gap: b.idx - a.idx, minSwingGap };
   }
+
   if (type === 'BEAR') {
     if (highs.length < 2) return { ok: false };
     const a = highs[highs.length - 2];
@@ -656,10 +695,13 @@ function rsiDivergence({ candles, rsiArr, type }) {
     const rA = rsiArr[a.idx];
     const rB = rsiArr[b.idx];
     if (rA == null || rB == null) return { ok: false };
+
+    const gapOk = (b.idx - a.idx) >= minSwingGap;
     // price higher high, RSI lower high
-    const ok = b.price > a.price && rB < rA;
-    return { ok, a, b, rA, rB };
+    const ok = gapOk && b.price > a.price && rB < rA;
+    return { ok, a, b, rA, rB, gap: b.idx - a.idx, minSwingGap };
   }
+
   return { ok: false };
 }
 
@@ -879,6 +921,17 @@ async function analyzeSymbol(symbol) {
   for (const itv of INTERVALS) data[itv] = await getCandles(symbol, itv);
 
   const c5 = last(data['5m']);
+
+  // Freshness guard: avoid trading on stale candle data (e.g., sync job stuck / API outage).
+  // Default: if latest 5m candle is older than 15 minutes, skip analysis.
+  const maxStalenessMs = Number(process.env.MAX_CANDLE_STALENESS_MS ?? 15 * 60 * 1000);
+  if (c5?.open_time && maxStalenessMs > 0) {
+    const ageMs = Date.now() - Number(c5.open_time);
+    if (Number.isFinite(ageMs) && ageMs > maxStalenessMs) {
+      logger.warn({ symbol, open_time: c5.open_time, ageMs, maxStalenessMs }, 'Candle data too stale; skipping analysis');
+      return null;
+    }
+  }
   const c15 = last(data['15m']);
   const c30 = last(data['30m']);
   const c1h = last(data['1h']);
@@ -1130,7 +1183,10 @@ async function main() {
   const qtyMap = parseSymbolQtyMap(process.env.SYMBOL_QTY_MAP);
 
   const results = [];
-  for (const s of symbolsToAnalyze) results.push(await analyzeSymbol(s));
+  for (const s of symbolsToAnalyze) {
+    const r = await analyzeSymbol(s);
+    if (r) results.push(r);
+  }
 
   const now = new Date().toISOString();
 
