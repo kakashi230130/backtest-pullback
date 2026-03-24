@@ -20,7 +20,7 @@ function sleep(ms) {
 }
 
 // Prevent spamming protective order creation within a single watcher burst run.
-// Key: `${tradeId}:SL` / `${tradeId}:TP` → lastAttemptMs
+// Key: `${tradeId}:SL` / `${tradeId}:TP` / `${tradeId}:MOVE_SL` → lastAttemptMs
 const protectiveAttemptMs = new Map();
 function recentlyAttempted(key, windowMs) {
   const t = protectiveAttemptMs.get(key);
@@ -30,10 +30,16 @@ function markAttempt(key) {
   protectiveAttemptMs.set(key, Date.now());
 }
 
+// In-memory trailing state (persisted for the life of this watcher process).
+// We avoid DB schema changes; restart will reset these, but SL position is still enforced on-exchange and via mark-price failsafe.
+const trailState = new Map();
+// tradeId -> { entry, initialSl, R, highWater, lowWater }
+
 async function getTradesToSync(limit = 20) {
   const [rows] = await pool.query(
     `
     SELECT id, symbol, side, status,
+           entry_price,
            quantity, stop_loss, take_profit,
            entry_order_id, entry_client_order_id,
            sl_order_id, sl_client_order_id,
@@ -51,6 +57,7 @@ async function getTradesToSync(limit = 20) {
     symbol: r.symbol,
     side: r.side,
     status: r.status,
+    entry_price: r.entry_price == null ? null : Number(r.entry_price),
     quantity: r.quantity == null ? null : Number(r.quantity),
     stop_loss: r.stop_loss == null ? null : Number(r.stop_loss),
     take_profit: r.take_profit == null ? null : Number(r.take_profit),
@@ -90,6 +97,99 @@ function hitSlTpByPrice({ tradeSide, price, sl, tp }) {
     if (tp != null && price <= tp) return { hit: 'TP' };
   }
   return { hit: null };
+}
+
+function clamp(n, lo, hi) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return lo;
+  return Math.min(hi, Math.max(lo, x));
+}
+
+function roundToTick(x) {
+  // We don't have exchange tickSize here; keep raw precision.
+  // Binance will round/reject; if needed, implement symbol filters later.
+  return Number(x);
+}
+
+async function placeOrUpdateStopLoss({ tr, stopPrice, now, reason }) {
+  if (!tradingEnabled) return { placed: false, mode: 'DRY_RUN' };
+  const closeSide = tr.side === 'LONG' ? 'SELL' : 'BUY';
+
+  // 1) cancel old SL if any (best-effort)
+  try { await cancelIfExists(tr.symbol, tr.sl_order_id, tr.sl_client_order_id); } catch {}
+
+  // 2) place a fresh SL order (best-effort with fallbacks)
+  let slRes = null;
+  let slStatus = null;
+  let slOrderId = null;
+  let slClientId = null;
+
+  try {
+    try {
+      slRes = await placeFuturesStopLossMarket({
+        symbol: tr.symbol,
+        side: closeSide,
+        stopPrice: roundToTick(stopPrice),
+        quantity: tr.quantity,
+        closePosition: true,
+        reduceOnly: null,
+        positionSide: null,
+      });
+      slStatus = slRes?.status ?? 'NEW';
+      slOrderId = slRes?.orderId ?? slRes?.algoId ?? null;
+      slClientId = slRes?.clientOrderId ?? slRes?.clientAlgoId ?? null;
+    } catch (err1) {
+      const code = err1?.response?.data?.code;
+      if (code === -4120) {
+        // Fallback: STOP (limit) if STOP_MARKET unsupported on this account
+        const stop = Number(stopPrice);
+        const slipPct = Number(process.env.SL_LIMIT_SLIPPAGE_PCT ?? 0.001); // 0.1%
+        const slip = clamp(slipPct, 0, 0.01);
+        const limitPrice = closeSide === 'SELL' ? stop * (1 - slip) : stop * (1 + slip);
+
+        try {
+          slRes = await placeFuturesStopLossLimit({
+            symbol: tr.symbol,
+            side: closeSide,
+            stopPrice: stop,
+            price: limitPrice,
+            quantity: tr.quantity,
+            reduceOnly: true,
+            positionSide: null,
+          });
+          slStatus = slRes?.status ?? 'NEW';
+          slOrderId = slRes?.orderId ?? null;
+          slClientId = slRes?.clientOrderId ?? null;
+        } catch (err2) {
+          const code2 = err2?.response?.data?.code;
+          if (code2 === -4120) {
+            logger.warn({ id: tr.id, symbol: tr.symbol, code: code2 }, 'Cannot place exchange SL (unsupported); will rely on mark-price failsafe');
+            slRes = null;
+            slStatus = 'UNSUPPORTED';
+          } else {
+            throw err2;
+          }
+        }
+      } else {
+        throw err1;
+      }
+    }
+  } catch (err) {
+    logger.warn({ err, id: tr.id, symbol: tr.symbol }, 'Move SL failed (ignored)');
+  }
+
+  await updateTrade(tr.id, {
+    stop_loss: stopPrice,
+    sl_order_id: slOrderId == null ? null : String(slOrderId),
+    sl_client_order_id: slClientId ?? null,
+    sl_order_status: slStatus,
+    last_sync_at: now,
+    notes: `${(reason ?? 'MOVE_SL')} @${stopPrice}`.slice(0, 255),
+  });
+
+  logger.info({ id: tr.id, symbol: tr.symbol, stopPrice, slStatus }, 'SL moved/updated');
+
+  return { placed: slRes != null, slStatus };
 }
 
 async function closeNowAtMarket(tr, reason, price) {
@@ -394,6 +494,90 @@ async function syncOne(tr) {
   }
 
   if (tr.status === 'ACTIVE') {
+    // Auto breakeven + trailing stop (optional)
+    // - Default behavior:
+    //   + at +1R: move SL to entry (optionally with small offset)
+    //   + from +2R: trail in 1R steps (lock 1R at 2R, lock 2R at 3R, ...)
+    const beEnabled = (process.env.AUTO_BREAKEVEN_ENABLED ?? '1') === '1';
+    const trailEnabled = (process.env.TRAILING_STOP_ENABLED ?? '1') === '1';
+
+    if ((beEnabled || trailEnabled) && tr.entry_price != null && tr.stop_loss != null && tr.quantity) {
+      const entry = Number(tr.entry_price);
+      const slNow = Number(tr.stop_loss);
+
+      if (Number.isFinite(entry) && Number.isFinite(slNow)) {
+        // initialize state (watermarks) for this trade id
+        if (!trailState.has(tr.id)) {
+          const R0 = tr.side === 'LONG' ? (entry - slNow) : (slNow - entry);
+          if (!Number.isFinite(R0) || R0 <= 0) {
+            // can't compute R, skip
+            // (this can happen if SL got set on the wrong side due to bad data)
+            return;
+          }
+          trailState.set(tr.id, {
+            entry,
+            initialSl: slNow,
+            R: R0,
+            highWater: null,
+            lowWater: null,
+          });
+        }
+
+        try {
+          const pi = await getFuturesPremiumIndex({ symbol: tr.symbol });
+          const price = Number(pi.markPrice);
+
+          if (Number.isFinite(price) && price > 0) {
+            const stW = trailState.get(tr.id);
+            if (stW) {
+              stW.highWater = stW.highWater == null ? price : Math.max(stW.highWater, price);
+              stW.lowWater = stW.lowWater == null ? price : Math.min(stW.lowWater, price);
+            }
+
+            const Rbase = Number(stW?.R);
+            if (!Number.isFinite(Rbase) || Rbase <= 0) return;
+
+            const favorable = tr.side === 'LONG' ? (price - entry) : (entry - price);
+            const favorableR = favorable / Rbase;
+
+            const moveWindowMs = Number(process.env.MOVE_SL_RETRY_WINDOW_MS ?? 30000);
+            const attemptKey = `${tr.id}:MOVE_SL`;
+
+            // 1) Breakeven at +1R (only if SL is still on the risky side of entry)
+            if (beEnabled && favorableR >= Number(process.env.AUTO_BE_AT_R ?? 1)) {
+              const beOffsetPct = Number(process.env.AUTO_BE_OFFSET_PCT ?? 0); // e.g. 0.0001 = 0.01%
+              const off = entry * clamp(beOffsetPct, 0, 0.002);
+              const bePrice = tr.side === 'LONG' ? (entry + off) : (entry - off);
+
+              const needsBE = tr.side === 'LONG' ? slNow < bePrice : slNow > bePrice;
+              if (needsBE && !recentlyAttempted(attemptKey, moveWindowMs)) {
+                markAttempt(attemptKey);
+                await placeOrUpdateStopLoss({ tr, stopPrice: bePrice, now, reason: 'AUTO_BREAKEVEN' });
+                return; // avoid doing more actions in same tick after moving SL
+              }
+            }
+
+            // 2) Trailing from +2R: lock profits in 1R steps
+            if (trailEnabled && favorableR >= Number(process.env.TRAIL_START_R ?? 2)) {
+              const lockR = Math.max(1, Math.floor(favorableR) - 1);
+              const desired = tr.side === 'LONG'
+                ? (entry + lockR * Rbase)
+                : (entry - lockR * Rbase);
+
+              const needsTrail = tr.side === 'LONG' ? slNow < desired : slNow > desired;
+              if (needsTrail && !recentlyAttempted(attemptKey, moveWindowMs)) {
+                markAttempt(attemptKey);
+                await placeOrUpdateStopLoss({ tr, stopPrice: desired, now, reason: `AUTO_TRAIL_LOCK_${lockR}R` });
+                return;
+              }
+            }
+          }
+        } catch (err) {
+          logger.warn({ err, id: tr.id, symbol: tr.symbol }, 'Breakeven/trailing check failed (ignored)');
+        }
+      }
+    }
+
     // By default, do NOT create new SL/TP when trade is already ACTIVE.
     // Set ENABLE_ACTIVE_BACKFILL=1 only if you explicitly want the watcher to place missing protective orders.
     const enableActiveBackfill = process.env.ENABLE_ACTIVE_BACKFILL === '1';

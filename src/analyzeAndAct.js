@@ -579,6 +579,28 @@ function isSideways({ adxNow, slope50, rangePct }) {
   return false;
 }
 
+function volumeSpikeOk(candles, { lookback = 20, mult = 1.5 } = {}) {
+  if (!candles || candles.length < lookback + 2) return { ok: false, reason: 'VOLUME_NOT_ENOUGH_BARS' };
+
+  const useMult = Math.max(1.0, Math.min(Number(mult) || 1.5, 10));
+  const n = Math.max(5, Math.min(Number(lookback) || 20, 200));
+
+  const cur = candles[candles.length - 1];
+  const prev = candles.slice(Math.max(0, candles.length - 1 - n), candles.length - 1);
+
+  const curVol = Number(cur?.volume);
+  if (!Number.isFinite(curVol)) return { ok: false, reason: 'VOLUME_CUR_INVALID' };
+
+  const vols = prev.map(x => Number(x.volume)).filter(Number.isFinite);
+  if (vols.length < Math.max(5, Math.floor(n * 0.6))) return { ok: false, reason: 'VOLUME_PREV_INVALID' };
+
+  const avg = vols.reduce((a, b) => a + b, 0) / vols.length;
+  if (!(avg > 0)) return { ok: false, reason: 'VOLUME_AVG_INVALID' };
+
+  const ok = curVol >= avg * useMult;
+  return { ok, curVol, avg, mult: useMult, lookback: n };
+}
+
 function swingPoints(candles, left = 2, right = 2) {
   const highs = [];
   const lows = [];
@@ -729,6 +751,23 @@ function isEntrySignalV2({ bias, candles30, candles15, candles5 }) {
     if (bias === 'BUY' && c5.rsi < buyMin) return { ok: false, reason: 'SCALP_NO_LTF_MOMENTUM', details: { rsi5: c5.rsi } };
     if (bias === 'SELL' && c5.rsi > sellMax) return { ok: false, reason: 'SCALP_NO_LTF_MOMENTUM', details: { rsi5: c5.rsi } };
 
+    // Volume filter (default: require 5m signal candle volume > MA(lookback)*mult)
+    const volEnabled = (process.env.VOLUME_FILTER_ENABLED ?? '1') === '1';
+    if (volEnabled) {
+      const tf = String(process.env.VOLUME_FILTER_TF ?? '5m').toLowerCase(); // '5m' | '15m' | 'both'
+      const lookback = Number(process.env.VOLUME_LOOKBACK ?? 20);
+      const mult = Number(process.env.SCALP_VOLUME_MULT ?? process.env.VOLUME_MULT ?? 1.5);
+
+      const v5 = volumeSpikeOk(candles5, { lookback, mult });
+      const v15 = volumeSpikeOk(candles15, { lookback, mult });
+
+      if (tf === '5m' && !v5.ok) return { ok: false, reason: 'SCALP_VOLUME_FILTER_5M', details: v5 };
+      if (tf === '15m' && !v15.ok) return { ok: false, reason: 'SCALP_VOLUME_FILTER_15M', details: v15 };
+      if (tf === 'both' && (!v5.ok || !v15.ok)) {
+        return { ok: false, reason: 'SCALP_VOLUME_FILTER_BOTH', details: { v5, v15 } };
+      }
+    }
+
     return {
       ok: true,
       mode: 'SCALP',
@@ -802,6 +841,23 @@ function isEntrySignalV2({ bias, candles30, candles15, candles5 }) {
   if (c5.rsi == null) return { ok: false, reason: 'NO_RSI_5M' };
   if (bias === 'BUY' && c5.rsi < 52) return { ok: false, reason: 'NO_LTF_MOMENTUM' };
   if (bias === 'SELL' && c5.rsi > 48) return { ok: false, reason: 'NO_LTF_MOMENTUM' };
+
+  // Volume filter (default: require 5m signal candle volume > MA(lookback)*mult)
+  const volEnabled = (process.env.VOLUME_FILTER_ENABLED ?? '1') === '1';
+  if (volEnabled) {
+    const tf = String(process.env.VOLUME_FILTER_TF ?? '5m').toLowerCase(); // '5m' | '15m' | 'both'
+    const lookback = Number(process.env.VOLUME_LOOKBACK ?? 20);
+    const mult = Number(process.env.VOLUME_MULT ?? 1.5);
+
+    const v5 = volumeSpikeOk(candles5, { lookback, mult });
+    const v15 = volumeSpikeOk(candles15, { lookback, mult });
+
+    if (tf === '5m' && !v5.ok) return { ok: false, reason: 'VOLUME_FILTER_5M', details: v5 };
+    if (tf === '15m' && !v15.ok) return { ok: false, reason: 'VOLUME_FILTER_15M', details: v15 };
+    if (tf === 'both' && (!v5.ok || !v15.ok)) {
+      return { ok: false, reason: 'VOLUME_FILTER_BOTH', details: { v5, v15 } };
+    }
+  }
 
   return {
     ok: true,
