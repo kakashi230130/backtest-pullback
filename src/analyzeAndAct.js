@@ -9,6 +9,7 @@ import {
   placeFuturesTakeProfitMarket,
   cancelFuturesOrder,
   placeFuturesMarketOrder,
+  getFuturesOrder,
 } from './binanceTradeClient.js';
 
 const INTERVALS = ['5m', '15m', '30m', '1h', '4h', '1d'];
@@ -72,6 +73,10 @@ async function getCandles(symbol, interval, limit = 260) {
 
 function last(arr) {
   return arr[arr.length - 1];
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 function recentSwingLow(candles, lookback = 20) {
@@ -370,19 +375,111 @@ async function insertPendingTradeWithOrders({ symbol, side, entry, sl, tp, qty, 
   // Create entry on Binance
   // IMPORTANT: always generate a clientOrderId (string) so watcher can safely query even when orderId > 2^53.
   const entryClientOrderId = `oc_entry_${symbol}_${Date.now()}`.slice(0, 64);
-  const entryRes = await placeFuturesLimitOrder({
-    symbol,
-    side: entrySide,
-    quantity: qty,
-    price: entry,
-    newClientOrderId: entryClientOrderId,
-  });
 
-  // NOTE: Do NOT place SL/TP here.
-  // Rationale: if SL/TP placement errors, we would fail before inserting the trade into DB.
-  // We keep analyze responsible for ENTRY + DB insert; watcher will place SL/TP after entry is FILLED.
-  const slRes = null;
-  const tpRes = null;
+  const scalpEntryMode = String(process.env.SCALP_ENTRY_MODE ?? 'MARKETABLE_LIMIT').toUpperCase();
+  // - MARKET: market order
+  // - MARKETABLE_LIMIT: limit order very close to current price to reduce slippage
+  // - LIMIT: legacy behavior
+  let entryRes;
+  if (scalpEntryMode === 'MARKET') {
+    entryRes = await placeFuturesMarketOrder({
+      symbol,
+      side: entrySide,
+      quantity: qty,
+      reduceOnly: null,
+      positionSide: null,
+      newClientOrderId: entryClientOrderId,
+    });
+  } else {
+    // Default: marketable limit
+    const slipPct = Number(process.env.SCALP_MARKETABLE_LIMIT_SLIP_PCT ?? 0.0002); // 0.02%
+    const slip = Math.max(0, Math.min(slipPct, 0.002));
+    const price = entrySide === 'BUY' ? Number(entry) * (1 + slip) : Number(entry) * (1 - slip);
+    entryRes = await placeFuturesLimitOrder({
+      symbol,
+      side: entrySide,
+      quantity: qty,
+      price,
+      newClientOrderId: entryClientOrderId,
+    });
+  }
+
+  // Safer execution: ONLY place SL/TP once entry is confirmed FILLED.
+  // We optionally poll the entry status briefly to reduce the naked-position window,
+  // but we do NOT place conditional orders before a position exists.
+  let slRes = null;
+  let tpRes = null;
+
+  const wantFastProtect = (process.env.PLACE_SLTP_FAST_AFTER_FILL ?? '1') === '1';
+  const allowPoll = (process.env.ENTRY_FILL_POLL_ENABLED ?? '1') === '1';
+  const pollMs = Math.max(0, Math.min(Number(process.env.ENTRY_FILL_POLL_MS ?? 6000), 30000));
+  const pollStepMs = Math.max(200, Math.min(Number(process.env.ENTRY_FILL_POLL_STEP_MS ?? 500), 2000));
+
+  let filled = String(entryRes?.status ?? '').toUpperCase() === 'FILLED';
+
+  if (!filled && allowPoll && tradingEnabled) {
+    const until = Date.now() + pollMs;
+    while (Date.now() < until) {
+      await sleep(pollStepMs);
+      try {
+        const st = await getFuturesOrder({
+          symbol,
+          orderId: entryRes?.orderId ?? null,
+          origClientOrderId: entryRes?.clientOrderId ?? entryClientOrderId,
+        });
+        const s = String(st?.status ?? '').toUpperCase();
+        if (s === 'FILLED') {
+          filled = true;
+          entryRes = { ...entryRes, status: st.status };
+          break;
+        }
+        if (['CANCELED', 'REJECTED', 'EXPIRED'].includes(s)) {
+          break;
+        }
+      } catch (err) {
+        // ignore and let watcher handle
+        break;
+      }
+    }
+  }
+
+  if (filled && wantFastProtect && tradingEnabled) {
+    try {
+      const slClientOrderId = `oc_sl_${symbol}_${Date.now()}`.slice(0, 64);
+      slRes = await placeFuturesStopLossMarket({
+        symbol,
+        side: closeSide,
+        stopPrice: sl,
+        quantity: qty,
+        closePosition: true,
+        reduceOnly: true,
+        positionSide: null,
+        newClientOrderId: slClientOrderId,
+      });
+    } catch (err) {
+      logger.warn({ err, symbol }, 'Fast-after-fill SL placement failed (ignored)');
+      slRes = null;
+    }
+
+    try {
+      const tpClientOrderId = `oc_tp_${symbol}_${Date.now()}`.slice(0, 64);
+      tpRes = await placeFuturesTakeProfitMarket({
+        symbol,
+        side: closeSide,
+        stopPrice: tp,
+        quantity: qty,
+        closePosition: true,
+        reduceOnly: true,
+        positionSide: null,
+        newClientOrderId: tpClientOrderId,
+      });
+    } catch (err) {
+      logger.warn({ err, symbol }, 'Fast-after-fill TP placement failed (ignored)');
+      tpRes = null;
+    }
+  }
+
+  const initialStatus = entryRes?.status === 'FILLED' ? 'ACTIVE' : 'PENDING';
 
   await pool.query(
     `
@@ -399,7 +496,7 @@ async function insertPendingTradeWithOrders({ symbol, side, entry, sl, tp, qty, 
     VALUES (
       :exchange,
       :symbol, :side, :leverage, :entry, :qty, :sl, :tp,
-      'PENDING', :now, :notes,
+      :status, :now, :notes,
       :entry_order_id, :entry_client_order_id,
       :sl_order_id, :sl_client_order_id,
       :tp_order_id, :tp_client_order_id,
@@ -418,19 +515,21 @@ async function insertPendingTradeWithOrders({ symbol, side, entry, sl, tp, qty, 
       tp,
       now,
       notes: notes?.slice(0, 255) ?? null,
+      status: initialStatus,
+
       // Keep orderId as string (may be > 2^53)
       entry_order_id: entryRes?.orderId == null ? null : String(entryRes.orderId),
       entry_client_order_id: entryRes?.clientOrderId ?? entryClientOrderId,
 
-      sl_order_id: slRes?.orderId == null ? null : String(slRes.orderId),
-      sl_client_order_id: slRes?.clientOrderId ?? null,
+      sl_order_id: slRes?.orderId == null ? null : String(slRes.orderId ?? slRes.algoId ?? null),
+      sl_client_order_id: slRes?.clientOrderId ?? slRes?.clientAlgoId ?? null,
 
-      tp_order_id: tpRes?.orderId == null ? null : String(tpRes.orderId),
-      tp_client_order_id: tpRes?.clientOrderId ?? null,
+      tp_order_id: tpRes?.orderId == null ? null : String(tpRes.orderId ?? tpRes.algoId ?? null),
+      tp_client_order_id: tpRes?.clientOrderId ?? tpRes?.clientAlgoId ?? null,
 
-      entry_order_status: entryRes.status ?? null,
-      sl_order_status: slRes?.status ?? null,
-      tp_order_status: tpRes?.status ?? null,
+      entry_order_status: entryRes?.status ?? null,
+      sl_order_status: slRes?.status ?? (slRes == null ? null : 'NEW'),
+      tp_order_status: tpRes?.status ?? (tpRes == null ? null : 'NEW'),
     },
   );
 
@@ -570,27 +669,39 @@ function isEntrySignalV2({ bias, candles30, candles15, candles5 }) {
     return { ok: true, mode: 'EASY', note: 'ANALYZE_EASY_MODE=1 (relaxed rules)' };
   }
 
-  // SCALP profile: loosen filters to get higher trade frequency.
-  // - Do NOT require divergence
-  // - Do NOT require MA-zone
-  // - Sideways filter is much looser
-  // - Structure is used as a "don't trade against obvious structure" filter
+  // SCALP profile: intraday/scalping reversal/continuation hybrid.
+  // Spec (suggest2):
+  // - Bias comes from HTF (handled outside): prioritize 4H then 1H
+  // - Use 15m divergence near MA zone + 5m momentum confirmation
+  // - Sideways filter: ignore ADX for divergence setups; keep rangePct/slope filters
+  // - SL/TP computed separately in setup section (structure-based SL)
   if (profile === 'scalp') {
     const c30 = last(candles30);
     const c15 = last(candles15);
     const c5 = last(candles5);
+
+    if (!c15 || !c5) return { ok: false, reason: 'MISSING_CANDLES' };
 
     const closes15 = candles15.map(c => c.close);
     const highs15 = candles15.map(c => c.high);
     const lows15 = candles15.map(c => c.low);
 
     const rsi15 = calcRsi(closes15, 14);
-    const adx15 = calcAdx(highs15, lows15, closes15, 14);
-    const adxNow = adx15[adx15.length - 1];
 
-    // Looser sideways filter
-    if (adxNow != null && adxNow < Number(process.env.SCALP_MIN_ADX ?? 12)) {
-      return { ok: false, reason: 'SCALP_LOW_ADX', details: { adxNow } };
+    // Sideways filter for scalp divergence setups:
+    // - Ignore ADX (often low during divergence / transition)
+    // - Keep slope/range compression filters to avoid ultra-chop
+    const ma50_15 = calcSma(closes15, 50);
+    const slope50 = maSlope(ma50_15, 10);
+    const window = candles15.slice(Math.max(0, candles15.length - 40));
+    const rangePct = window.length
+      ? (Math.max(...window.map(c => c.high)) - Math.min(...window.map(c => c.low))) / c15.close
+      : null;
+    if (slope50 != null && Math.abs(slope50) < Number(process.env.SCALP_MIN_ABS_SLOPE50 ?? 0.0015)) {
+      return { ok: false, reason: 'SCALP_FLAT_SLOPE', details: { slope50 } };
+    }
+    if (rangePct != null && rangePct < Number(process.env.SCALP_MIN_RANGE_PCT ?? 0.0045)) {
+      return { ok: false, reason: 'SCALP_TIGHT_RANGE', details: { rangePct } };
     }
 
     const struct15 = structureLabel(candles15);
@@ -604,21 +715,34 @@ function isEntrySignalV2({ bias, candles30, candles15, candles5 }) {
       return { ok: false, reason: 'SCALP_AGAINST_STRUCTURE', details: { struct15, struct30 } };
     }
 
-    // LTF confirmation (looser)
-    if (c5?.rsi == null) return { ok: false, reason: 'NO_RSI_5M' };
-    const buyMin = Number(process.env.SCALP_RSI5_BUY_MIN ?? 50.5);
-    const sellMax = Number(process.env.SCALP_RSI5_SELL_MAX ?? 49.5);
-    if (bias === 'BUY' && c5.rsi < buyMin) return { ok: false, reason: 'SCALP_NO_LTF_MOMENTUM' };
-    if (bias === 'SELL' && c5.rsi > sellMax) return { ok: false, reason: 'SCALP_NO_LTF_MOMENTUM' };
-
-    // Mild 15m RSI filter to avoid extremes
-    const r15 = rsi15[rsi15.length - 1];
-    if (r15 != null) {
-      if (bias === 'BUY' && r15 > Number(process.env.SCALP_RSI15_BUY_MAX ?? 72)) return { ok: false, reason: 'SCALP_RSI15_TOO_HIGH', details: { r15 } };
-      if (bias === 'SELL' && r15 < Number(process.env.SCALP_RSI15_SELL_MIN ?? 28)) return { ok: false, reason: 'SCALP_RSI15_TOO_LOW', details: { r15 } };
+    // Divergence on 15m at MA zone (spec)
+    const div = rsiDivergence({ candles: candles15, rsiArr: rsi15, type: bias === 'BUY' ? 'BULL' : 'BEAR' });
+    if (!div.ok) return { ok: false, reason: 'SCALP_NO_RSI_DIVERGENCE' };
+    if (!inMaZone(c15, Number(process.env.SCALP_MA_ZONE_PCT ?? 0.006))) {
+      return { ok: false, reason: 'SCALP_NOT_AT_MA_ZONE' };
     }
 
-    return { ok: true, mode: 'SCALP', struct15, struct30, adxNow };
+    // LTF confirmation (5m momentum)
+    if (c5?.rsi == null) return { ok: false, reason: 'NO_RSI_5M' };
+    const buyMin = Number(process.env.SCALP_RSI5_BUY_MIN ?? 52);
+    const sellMax = Number(process.env.SCALP_RSI5_SELL_MAX ?? 48);
+    if (bias === 'BUY' && c5.rsi < buyMin) return { ok: false, reason: 'SCALP_NO_LTF_MOMENTUM', details: { rsi5: c5.rsi } };
+    if (bias === 'SELL' && c5.rsi > sellMax) return { ok: false, reason: 'SCALP_NO_LTF_MOMENTUM', details: { rsi5: c5.rsi } };
+
+    return {
+      ok: true,
+      mode: 'SCALP',
+      struct15,
+      struct30,
+      div: {
+        type: bias === 'BUY' ? 'BULL' : 'BEAR',
+        priceA: div.a.price,
+        priceB: div.b.price,
+        rsiA: div.rA,
+        rsiB: div.rB,
+      },
+      sidewaysDetails: { slope50, rangePct },
+    };
   }
 
   const c30 = last(candles30);
@@ -713,12 +837,11 @@ async function analyzeSymbol(symbol) {
 
   let bias = decideBias(trend1d, trend4h, trend1h);
 
-  // SCALP profile bias: prioritize 4H, then 1H.
+  // SCALP profile bias (spec): use only 4H + 1H consensus, ignore 1D to reduce lag.
   if (profile === 'scalp') {
-    if (trend4h === 'BULL') bias = 'BUY';
-    else if (trend4h === 'BEAR') bias = 'SELL';
-    else if (trend1h === 'BULL') bias = 'BUY';
-    else if (trend1h === 'BEAR') bias = 'SELL';
+    if (trend4h === 'BULL' && trend1h === 'BULL') bias = 'BUY';
+    else if (trend4h === 'BEAR' && trend1h === 'BEAR') bias = 'SELL';
+    else bias = 'WAIT';
   }
 
   // TEMP DEBUG: If easy mode is on, allow a bias even when 2/3 HTFs are neutral,
@@ -735,56 +858,56 @@ async function analyzeSymbol(symbol) {
   // Compute candidate SL/TP (if we were to open)
   let setup = null;
 
-  // SCALP profile: use fixed-risk SL/TP (more frequent than swing-based).
+  // SCALP profile (spec): structure-based SL using last 3-5 candles on 5m + ATR buffer.
+  // TP = R-multiple (default 1.8R, configurable 1.5-2.0).
   if (!easyMode && profile === 'scalp' && bias !== 'WAIT' && entryCheck.ok) {
     const entry = Number(c5?.close);
     if (Number.isFinite(entry) && entry > 0) {
-      const riskPct = Number(process.env.SCALP_RISK_PCT ?? 0.0015); // 0.15%
-      const rMult = Number(process.env.SCALP_TP_R_MULT ?? 2); // TP = 2R (minimum RR 1:2)
+      const n = Number(process.env.SCALP_STRUCTURE_SL_BARS ?? 5); // 3-5 recommended
+      const bars = Math.max(3, Math.min(n, 8));
+      const slice = data['5m'].slice(Math.max(0, data['5m'].length - bars));
 
-      // Widen SL if market volatility is higher than pct-based risk (helps avoid too-tight stops)
       const highs5 = data['5m'].map(c => c.high);
       const lows5 = data['5m'].map(c => c.low);
       const closes5 = data['5m'].map(c => c.close);
       const atr5 = calcAtr(highs5, lows5, closes5, 14);
       const atrNow5 = atr5[atr5.length - 1];
-      const slAtrMult = Number(process.env.SCALP_SL_ATR_MULT ?? 0); // set e.g. 0.8 to use ATR-based minimum risk
-      const tpAtrMult = Number(process.env.SCALP_TP_ATR_MULT ?? 0); // set e.g. 1.6 to enforce minimum TP distance
-      const minRiskPct = Number(process.env.SCALP_MIN_RISK_PCT ?? 0); // enforce minimum SL distance as % of entry
-      const minTpPct = Number(process.env.SCALP_MIN_TP_PCT ?? 0); // enforce minimum TP distance as % of entry
+      const slAtrMult = Number(process.env.SCALP_SL_ATR_MULT ?? 0.35);
+      const slBuffer = atrNow5 != null ? atrNow5 * Math.max(0, slAtrMult) : 0;
 
-      const riskAbsPct = entry * Math.max(0.0001, Math.min(riskPct, 0.02));
-      const riskAbsMin = entry * Math.max(0, Math.min(minRiskPct, 0.05));
-      const riskAbsAtr = atrNow5 != null ? atrNow5 * Math.max(0, slAtrMult) : 0;
-      const riskAbs = Math.max(riskAbsPct, riskAbsMin, riskAbsAtr);
-
-      const tpAbsR = rMult * riskAbs;
-      const tpAbsMin = entry * Math.max(0, Math.min(minTpPct, 0.2));
-      const tpAbsAtr = atrNow5 != null ? atrNow5 * Math.max(0, tpAtrMult) : 0;
-      const tpAbs = Math.max(tpAbsR, tpAbsMin, tpAbsAtr);
+      const rMult = Number(process.env.SCALP_TP_R_MULT ?? 1.8);
+      const rrMult = Math.max(1.0, Math.min(rMult, 3.0));
 
       if (bias === 'BUY') {
-        const sl = entry - riskAbs;
-        const tp = entry + tpAbs;
-        setup = {
-          action: 'BUY',
-          entry,
-          sl,
-          tp,
-          rr: tpAbs / riskAbs,
-          reasons: { entryCheck, sltpMeta: { atrNow5, riskAbs, tpAbs } },
-        };
+        const structLow = Math.min(...slice.map(c => c.low));
+        const sl = structLow - slBuffer;
+        const risk = entry - sl;
+        if (risk > 0) {
+          const tp = entry + rrMult * risk;
+          setup = {
+            action: 'BUY',
+            entry,
+            sl,
+            tp,
+            rr: (tp - entry) / risk,
+            reasons: { entryCheck, sltpMeta: { bars, structLow, atrNow5, slBuffer, rrMult } },
+          };
+        }
       } else {
-        const sl = entry + riskAbs;
-        const tp = entry - tpAbs;
-        setup = {
-          action: 'SELL',
-          entry,
-          sl,
-          tp,
-          rr: tpAbs / riskAbs,
-          reasons: { entryCheck, sltpMeta: { atrNow5, riskAbs, tpAbs } },
-        };
+        const structHigh = Math.max(...slice.map(c => c.high));
+        const sl = structHigh + slBuffer;
+        const risk = sl - entry;
+        if (risk > 0) {
+          const tp = entry - rrMult * risk;
+          setup = {
+            action: 'SELL',
+            entry,
+            sl,
+            tp,
+            rr: (entry - tp) / risk,
+            reasons: { entryCheck, sltpMeta: { bars, structHigh, atrNow5, slBuffer, rrMult } },
+          };
+        }
       }
     }
   }

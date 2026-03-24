@@ -42,7 +42,7 @@ async function shutdown(signal) {
 }
 
 async function main() {
-  logger.info('Analyze scheduler started: every 10 minutes + 35s');
+  logger.info('Analyze scheduler started: every 5 minutes + delay seconds');
 
   // graceful shutdown (Ctrl+C / service stop)
   process.on('SIGINT', () => void shutdown('SIGINT'));
@@ -51,9 +51,12 @@ async function main() {
   // run immediately on start
   await runOnce('startup');
 
-  // 10m + 35s
-  cron.schedule('35 */10 * * * *', () => {
-    logger.info('Analyze cron tick');
+  // 5m + delay seconds (default 20s)
+  const delaySec = Number(process.env.ANALYZE_DELAY_SECONDS ?? 20);
+  const sec = Number.isFinite(delaySec) ? Math.max(0, Math.min(delaySec, 55)) : 20;
+
+  cron.schedule(`${sec} */5 * * * *`, () => {
+    logger.info({ sec }, 'Analyze cron tick');
     runOnce('cron');
   });
 }
