@@ -29,11 +29,9 @@ function candleHitsPrice(c, price) {
   return Number(c.low) <= Number(price) && Number(c.high) >= Number(price);
 }
 
-// CẬP NHẬT: Thêm yếu tố ngẫu nhiên để trượt giá chân thực hơn
 function applySlippage({ side, price, slippagePct }) {
   const p = Number(price);
-  const randomFactor = 0.5 + Math.random(); // Random từ 0.5x đến 1.5x slippage config
-  const s = clamp(slippagePct * randomFactor, 0, 0.01); 
+  const s = clamp(slippagePct, 0, 0.01);
   if (!(p > 0) || !(s > 0)) return p;
   if (side === 'LONG') return p * (1 + s);
   return p * (1 - s);
@@ -100,7 +98,7 @@ export function runBacktest({
   riskPerTrade = 0.01,
   leverage = 10,
   feeRate = 0.0004,
-  slippagePct = 0.0002, 
+  slippagePct = 0,
   data, 
   indicatorsFromDb = true,
   debug = false,
@@ -177,7 +175,7 @@ export function runBacktest({
         const entryFill = applySlippage({ side: pending.side, price: pending.entryPrice, slippagePct });
         const notional = entryFill * pending.qty;
         const feeIn = calcFee({ notional, feeRate });
-        balance -= feeIn;
+        balance -= feeIn; // Trừ phí vào lệnh một lần duy nhất
         equity = balance;
 
         open = {
@@ -190,7 +188,7 @@ export function runBacktest({
           fees: feeIn,
           maxFavorable: entryFill,
           minFavorable: entryFill,
-          qtyOriginal: pending.qty, 
+          qtyOriginal: pending.qty, // Giữ lại size gốc để log trade sau này
         };
         pending = null;
       }
@@ -212,6 +210,7 @@ export function runBacktest({
         const feeOut = calcFee({ notional: notionalOut, feeRate });
         const gross = pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: exitFill, qty: open.qty });
         
+        // SỬA LỖI: Chỉ trừ feeOut vào balance vì feeIn đã trừ lúc pending_filled
         balance += (gross - feeOut);
         equity = balance;
 
@@ -226,7 +225,7 @@ export function runBacktest({
           sl_initial: open.initialSl,
           sl_final: open.currentSl,
           tp: open.tp,
-          reason: open.ptp?.partialDone ? (open.currentSl !== open.initialSl && open.currentSl !== open.entryFill ? 'TRAILING_STOP' : 'BE_AFTER_PARTIAL') : 'SL',
+          reason: open.ptp?.partialDone ? 'BE_AFTER_PARTIAL' : 'SL',
           grossPnl: (open.ptp?.accumulatedGross || 0) + gross,
           fees: open.fees + (open.ptp?.accumulatedFees || 0) + feeOut,
           netPnl: ((open.ptp?.accumulatedGross || 0) + gross) - (open.fees + (open.ptp?.accumulatedFees || 0) + feeOut),
@@ -244,10 +243,8 @@ export function runBacktest({
             open.ptp = {
               R,
               partialDone: false,
-              // CẬP NHẬT: Chốt 50% ở mốc +1.5R thay vì +1R
-              partialPrice: open.side === 'LONG' ? (open.entryFill + 1.5 * R) : (open.entryFill - 1.5 * R),
-              // CẬP NHẬT: Đích đến cuối cùng là +3R
-              finalPrice: open.side === 'LONG' ? (open.entryFill + 3 * R) : (open.entryFill - 3 * R),
+              partialPrice: open.side === 'LONG' ? (open.entryFill + R) : (open.entryFill - R),
+              finalPrice: open.side === 'LONG' ? (open.entryFill + 2 * R) : (open.entryFill - 2 * R),
               accumulatedGross: 0,
               accumulatedFees: 0,
             };
@@ -265,6 +262,7 @@ export function runBacktest({
               const feeOut = calcFee({ notional: notionalOut, feeRate });
               const gross = pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: exitFill, qty: closeQty });
               
+              // Cộng lợi nhuận ròng của phần chốt lời vào balance
               balance += (gross - feeOut);
               
               open.ptp.accumulatedGross += gross;
@@ -272,22 +270,50 @@ export function runBacktest({
               open.qty -= closeQty;
               open.ptp.partialDone = true;
 
-              // CẬP NHẬT: Khóa lãi +0.5R thay vì chỉ về hòa vốn (BE). Đảm bảo 50% còn lại nếu dính SL vẫn có tiền.
-              const lockProfit = 0.5 * open.ptp.R;
-              const trailSL = open.side === 'LONG' ? (open.entryFill + lockProfit) : (open.entryFill - lockProfit);
-              open.currentSl = trailSL;
+              const feeBuf = open.entryFill * clamp(feeRate, 0, 0.01) * 2;
+              const be = open.side === 'LONG' ? (open.entryFill + feeBuf) : (open.entryFill - feeBuf);
+              open.currentSl = be;
+
+              // Kiểm tra xem nến hiện tại có quét trúng BE luôn không
+              const hitBeSame = open.side === 'LONG'
+                ? (c5.low <= open.currentSl)
+                : (c5.high >= open.currentSl);
+
+              if (hitBeSame) {
+                const exitFill2 = applySlippage({ side: open.side, price: open.currentSl, slippagePct });
+                const notionalOut2 = exitFill2 * open.qty;
+                const feeOut2 = calcFee({ notional: notionalOut2, feeRate });
+                const gross2 = pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: exitFill2, qty: open.qty });
+                
+                balance += (gross2 - feeOut2);
+
+                trades.push({
+                  symbol,
+                  side: open.side,
+                  entry_time: open.entryTime,
+                  exit_time: c5.open_time,
+                  entry: open.entryFill,
+                  exit: exitFill2,
+                  qty: open.qtyOriginal,
+                  sl_initial: open.initialSl,
+                  sl_final: open.currentSl,
+                  tp: open.ptp.finalPrice,
+                  reason: 'PTP_1R_THEN_BE',
+                  grossPnl: open.ptp.accumulatedGross + gross2,
+                  fees: open.fees + open.ptp.accumulatedFees + feeOut2,
+                  netPnl: (open.ptp.accumulatedGross + gross2) - (open.fees + open.ptp.accumulatedFees + feeOut2),
+                  leverage,
+                  margin_used: (open.entryFill * open.qtyOriginal) / Math.max(1, Number(leverage) || 1),
+                  meta: { ...open.meta, ptp: open.ptp },
+                });
+
+                open = null;
+                unrealized = 0;
+              }
             }
           }
 
           if (open && open.ptp?.partialDone) {
-            // CẬP NHẬT: Khóa lãi bậc 2. Nếu giá chạy được > 2R thì dời SL lên khóa lãi ở +1R
-            const favorable = open.side === 'LONG' ? (c5.high - open.entryFill) : (open.entryFill - c5.low);
-            if (favorable >= 2 * open.ptp.R) {
-              const trailPrice = open.side === 'LONG' ? (open.entryFill + 1 * open.ptp.R) : (open.entryFill - 1 * open.ptp.R);
-              if (open.side === 'LONG') open.currentSl = Math.max(open.currentSl, trailPrice);
-              else open.currentSl = Math.min(open.currentSl, trailPrice);
-            }
-
             const hitFinal = open.side === 'LONG'
               ? (c5.high >= open.ptp.finalPrice)
               : (c5.low <= open.ptp.finalPrice);
@@ -312,7 +338,7 @@ export function runBacktest({
                 sl_initial: open.initialSl,
                 sl_final: open.currentSl,
                 tp: open.ptp.finalPrice,
-                reason: 'TP_MAX_AFTER_PTP', // Đổi tên reason để dễ nhận biết
+                reason: 'TP_2R_AFTER_PTP',
                 grossPnl: open.ptp.accumulatedGross + gross,
                 fees: open.fees + open.ptp.accumulatedFees + feeOut,
                 netPnl: (open.ptp.accumulatedGross + gross) - (open.fees + open.ptp.accumulatedFees + feeOut),
@@ -326,6 +352,7 @@ export function runBacktest({
             }
           }
         } else {
+          // Logic TP thông thường
           const mv = maybeMoveStopLoss({
             side: open.side,
             entry: open.entryFill,
