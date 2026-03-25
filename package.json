@@ -15,7 +15,8 @@
     "backfill:latest200": "node src/backfillLatest200.js",
     "analyze": "node src/analyzeAndAct.js",
     "analyze:30m": "node src/analyzeScheduler.js",
-    "sample:order": "node src/sampleOrder.js"
+    "sample:order": "node src/sampleOrder.js",
+    "backtest": "node src/backtest/run.js"
   },
   "keywords": ["binance", "klines", "candles", "mysql", "cron"],
   "author": "",

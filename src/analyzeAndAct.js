@@ -115,9 +115,10 @@ async function getActiveTrades() {
     opened_at: r.opened_at == null ? null : Number(r.opened_at),
     notes: r.notes ?? null,
 
-    entry_order_id: r.entry_order_id == null ? null : Number(r.entry_order_id),
-    sl_order_id: r.sl_order_id == null ? null : Number(r.sl_order_id),
-    tp_order_id: r.tp_order_id == null ? null : Number(r.tp_order_id),
+    // IMPORTANT: Binance orderId can exceed JS Number safe range. Keep as string.
+    entry_order_id: r.entry_order_id == null ? null : String(r.entry_order_id),
+    sl_order_id: r.sl_order_id == null ? null : String(r.sl_order_id),
+    tp_order_id: r.tp_order_id == null ? null : String(r.tp_order_id),
   }));
 }
 
@@ -336,18 +337,25 @@ async function cancelAndCloseTradeOnExchange(trade, reason, price) {
     }
   }
 
-  // If it was already ACTIVE, also flatten position with a market order (best-effort).
-  // We use the trade.quantity as intended size.
+  // If it was already ACTIVE, flatten position on exchange FIRST.
+  // If the exchange close fails, do NOT mark DB as CLOSED (avoid naked-position desync).
   if (trade.status === 'ACTIVE' && trade.quantity) {
+    let closeOk = false;
     try {
       await placeFuturesMarketOrder({
         symbol: trade.symbol,
         side: trade.side === 'LONG' ? 'SELL' : 'BUY',
         quantity: trade.quantity,
+        reduceOnly: true,
+        positionSide: null,
       });
+      closeOk = true;
     } catch (err) {
-      logger.warn({ err, id: trade.id, symbol: trade.symbol }, 'Market close failed (ignored)');
+      logger.warn({ err, id: trade.id, symbol: trade.symbol }, 'Market close failed; keeping trade ACTIVE for watcher retry');
+      closeOk = false;
     }
+
+    if (!closeOk) return;
   }
 
   await updateTrade(trade.id, {
@@ -1216,47 +1224,62 @@ async function main() {
   const openAfter = await getActiveTrades();
   if (!openAfter.length) {
     const r = results[0];
-    const profile = (process.env.ANALYZE_PROFILE ?? 'strict').toLowerCase();
-    const minRr = profile === 'scalp'
-      ? Number(process.env.SCALP_MIN_RR ?? 2)
-      : 2;
-
-    // Re-entry safety: if the previous trade was stopped out while HTF trend is still strong,
-    // require a reversal candle confirmation before opening again in the same HTF direction.
-    const lastClosed = r?.symbol ? await getLastClosedTradeForSymbol(r.symbol) : null;
-
-    if (r.setup && r.setup.rr >= minRr) {
-      const blockInfo = shouldBlockReentryAfterStopout({
-        lastClosedTrade: lastClosed,
-        bias: r.bias,
-        trends: r.trends,
-        reversalConfirm: r.reentryReversal,
-      });
-
-      if (blockInfo.block) {
-        actions.push({ type: 'WAIT', reason: blockInfo.reason, details: blockInfo.details });
-      } else {
-        // Quantity is user-defined in demo; use SYMBOL_QTY_MAP if available.
-        const qty = qtyMap[r.symbol] ?? 0;
-        if (!qty) {
-          actions.push({ type: 'WAIT', reason: 'MISSING_QTY', hint: 'Set SYMBOL_QTY_MAP like ETHUSDT:0.1' });
-        } else {
-          const side = r.setup.action === 'BUY' ? 'LONG' : 'SHORT';
-          await insertPendingTradeWithOrders({
-            symbol: r.symbol,
-            side,
-            entry: format(r.setup.entry),
-            sl: format(r.setup.sl),
-            tp: format(r.setup.tp),
-            qty: format(qty),
-            leverage: null,
-            notes: `AUTO_OPEN ${r.setup.action} rr=${r.setup.rr.toFixed(2)}`,
-          });
-          actions.push({ type: 'OPEN', symbol: r.symbol, side: r.setup.action, entry: r.setup.entry, sl: r.setup.sl, tp: r.setup.tp, rr: r.setup.rr, qty, status: 'PENDING' });
-        }
-      }
+    if (!r) {
+      actions.push({ type: 'WAIT', reason: 'NO_ANALYSIS_RESULT' });
+      // continue to output payload
     } else {
-      actions.push({ type: 'WAIT' });
+      const profile = (process.env.ANALYZE_PROFILE ?? 'strict').toLowerCase();
+      const minRr = profile === 'scalp'
+        ? Number(process.env.SCALP_MIN_RR ?? 2)
+        : 2;
+
+      // Re-entry safety: if the previous trade was stopped out while HTF trend is still strong,
+      // require a reversal candle confirmation before opening again in the same HTF direction.
+      const lastClosed = r?.symbol ? await getLastClosedTradeForSymbol(r.symbol) : null;
+
+      if (r.setup && r.setup.rr >= minRr) {
+        const blockInfo = shouldBlockReentryAfterStopout({
+          lastClosedTrade: lastClosed,
+          bias: r.bias,
+          trends: r.trends,
+          reversalConfirm: r.reentryReversal,
+        });
+
+        if (blockInfo.block) {
+          actions.push({ type: 'WAIT', reason: blockInfo.reason, details: blockInfo.details });
+        } else {
+          // Quantity is user-defined in demo; use SYMBOL_QTY_MAP if available.
+          const qty = qtyMap[r.symbol] ?? 0;
+          if (!qty) {
+            actions.push({ type: 'WAIT', reason: 'MISSING_QTY', hint: 'Set SYMBOL_QTY_MAP like ETHUSDT:0.1' });
+          } else {
+            const side = r.setup.action === 'BUY' ? 'LONG' : 'SHORT';
+            await insertPendingTradeWithOrders({
+              symbol: r.symbol,
+              side,
+              entry: format(r.setup.entry),
+              sl: format(r.setup.sl),
+              tp: format(r.setup.tp),
+              qty: format(qty),
+              leverage: null,
+              notes: `AUTO_OPEN ${r.setup.action} rr=${r.setup.rr.toFixed(2)}`,
+            });
+            actions.push({
+              type: 'OPEN',
+              symbol: r.symbol,
+              side: r.setup.action,
+              entry: r.setup.entry,
+              sl: r.setup.sl,
+              tp: r.setup.tp,
+              rr: r.setup.rr,
+              qty,
+              status: 'PENDING',
+            });
+          }
+        }
+      } else {
+        actions.push({ type: 'WAIT' });
+      }
     }
   }
 
