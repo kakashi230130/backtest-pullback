@@ -58,30 +58,82 @@ function isPullbackReversalCandle({ bias, candles15, candles30 }) {
   return { ok: false, why: 'BIAS_WAIT' };
 }
 
+function wickRejectionOk({ bias, c5, c15 }) {
+  // Require wick rejection ("rút chân" / rejection) on M5 or M15.
+  // Default threshold: wick >= 40% of full candle range.
+  const need = Number(process.env.PULLBACK_WICK_MIN_PCT ?? 0.4);
+  const minPct = Math.max(0.2, Math.min(need, 0.9));
+
+  function okOne(c) {
+    const x = candleParts(c);
+    if (!x) return false;
+    const range = x.high - x.low;
+    if (!(range > 0)) return false;
+
+    const lowerPct = x.lowerWick / range;
+    const upperPct = x.upperWick / range;
+
+    if (bias === 'BUY') {
+      // Prefer close above open for buy rejection, but keep it optional via env.
+      const requireBull = (process.env.PULLBACK_REQUIRE_BULL_REJECT ?? '0') === '1';
+      if (requireBull && !x.isBull) return false;
+      return lowerPct >= minPct;
+    }
+
+    if (bias === 'SELL') {
+      const requireBear = (process.env.PULLBACK_REQUIRE_BEAR_REJECT ?? '0') === '1';
+      if (requireBear && !x.isBear) return false;
+      return upperPct >= minPct;
+    }
+
+    return false;
+  }
+
+  const ok = okOne(c5) || okOne(c15);
+  return { ok, minPct };
+}
+
 function isEntrySignalPullback({ bias, candles30, candles15, candles5 }) {
-  // New strategy requested: PULLBACK_STRATEGY
-  // Spec:
-  // - HTF trend (4H/1H) must align strongly (bias already derived outside)
-  // - Price pullback into MA20/MA50 zone (wider zone)
-  // - Reversal candle (Engulfing/Pinbar-like)
+  // PULLBACK_STRATEGY (refined):
+  // - Trend must be strong enough: ADX(15m) >= min
+  // - Price near MA zone (wider)
+  // - Wick rejection on M5/M15
+  // - Optional reversal candle pattern (engulfing / pinbar-like)
   // - Volume spike confirmation
   // - NO RSI divergence requirement
 
   if (bias !== 'BUY' && bias !== 'SELL') return { ok: false, reason: 'BIAS_WAIT' };
 
   const c15 = last(candles15);
-  if (!c15) return { ok: false, reason: 'MISSING_CANDLES' };
+  const c5 = last(candles5);
+  if (!c15 || !c5) return { ok: false, reason: 'MISSING_CANDLES' };
+
+  // ADX filter (15m)
+  const highs15 = candles15.map(c => c.high);
+  const lows15 = candles15.map(c => c.low);
+  const closes15 = candles15.map(c => c.close);
+  const adx15 = calcAdx(highs15, lows15, closes15, 14);
+  const adxNow = adx15[adx15.length - 1];
+  const minAdx = Number(process.env.PULLBACK_ADX_MIN ?? 25);
+  if (adxNow == null || adxNow < minAdx) {
+    return { ok: false, reason: 'PULLBACK_ADX_TOO_LOW', details: { adxNow, minAdx } };
+  }
 
   // Wider MA zone (default 1.0% ; configurable up to 1.2%)
   const zone = Number(process.env.MA_ZONE_PCT ?? 0.01);
   const maZonePct = Math.max(0.006, Math.min(zone, 0.02));
   if (!inMaZone(c15, maZonePct)) return { ok: false, reason: 'NOT_AT_MA_ZONE', details: { maZonePct } };
 
+  // Wick rejection requirement (M5/M15)
+  const wick = wickRejectionOk({ bias, c5, c15 });
+  if (!wick.ok) return { ok: false, reason: 'NO_WICK_REJECTION', details: { minPct: wick.minPct } };
+
+  // Optional: reversal candle pattern (keep enabled by default, but can be relaxed)
+  const requirePattern = (process.env.PULLBACK_REQUIRE_PATTERN ?? '1') === '1';
   const rev = isPullbackReversalCandle({ bias, candles15, candles30 });
-  if (!rev.ok) return { ok: false, reason: 'NO_REVERSAL_CANDLE', details: rev };
+  if (requirePattern && !rev.ok) return { ok: false, reason: 'NO_REVERSAL_CANDLE', details: rev };
 
   // LTF momentum: relaxed thresholds (default BUY>=45, SELL<=55)
-  const c5 = last(candles5);
   if (c5?.rsi == null) return { ok: false, reason: 'NO_RSI_5M' };
   const buyMin = Number(process.env.PULLBACK_RSI5_BUY_MIN ?? 45);
   const sellMax = Number(process.env.PULLBACK_RSI5_SELL_MAX ?? 55);
@@ -100,7 +152,18 @@ function isEntrySignalPullback({ bias, candles30, candles15, candles5 }) {
   if (tf === '15m' && !v15.ok) return { ok: false, reason: 'VOLUME_FILTER_15M', details: v15 };
   if (tf === 'both' && (!v5.ok || !v15.ok)) return { ok: false, reason: 'VOLUME_FILTER_BOTH', details: { v5, v15 } };
 
-  return { ok: true, mode: 'PULLBACK', details: { maZonePct, reversal: rev.why, volume: tf === '15m' ? v15 : v5 } };
+  return {
+    ok: true,
+    mode: 'PULLBACK',
+    details: {
+      adxNow,
+      minAdx,
+      maZonePct,
+      wickMinPct: wick.minPct,
+      reversal: requirePattern ? rev.why : 'SKIPPED',
+      volume: tf === '15m' ? v15 : v5,
+    },
+  };
 }
 
 function maSlope(maArr, bars = 10) {
@@ -642,38 +705,90 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs }) {
     const offsetPct = Math.min(Math.max(offsetPctRaw, 0), Math.max(offsetMaxRaw, 0));
     const entry = bias === 'BUY' ? base * (1 - offsetPct) : base * (1 + offsetPct);
 
-    const lookback = Number(process.env.SL_SWING_LOOKBACK ?? 20);
-    const slAtrMult = Number(process.env.SL_ATR_MULT ?? 0.35);
-    const tpAtrMult = Number(process.env.TP_ATR_MULT ?? 0);
-    const minRiskPct = Number(process.env.MIN_RISK_PCT ?? 0);
-    const minTpPct = Number(process.env.MIN_TP_PCT ?? 0);
+    // If using PULLBACK_STRATEGY, use ATR-based dynamic SL per new requirement:
+    // SL = SwingLow - k*ATR(5m)  (BUY)
+    // SL = SwingHigh + k*ATR(5m) (SELL)
+    const strategy = String(process.env.ANALYZE_STRATEGY ?? 'DEFAULT').toUpperCase();
+    if (strategy === 'PULLBACK_STRATEGY') {
+      const lookback5 = Number(process.env.PULLBACK_SWING_LOOKBACK_5M ?? 30);
+      const highs5 = data['5m'].map(c => c.high);
+      const lows5 = data['5m'].map(c => c.low);
+      const closes5 = data['5m'].map(c => c.close);
+      const atr5 = calcAtr(highs5, lows5, closes5, 14);
+      const atrNow5 = atr5[atr5.length - 1];
+      const k = Number(process.env.PULLBACK_SL_ATR_MULT ?? 1.5);
+      const slBuf = atrNow5 != null ? atrNow5 * Math.max(0, k) : 0;
 
-    const highs15 = data['15m'].map(c => c.high);
-    const lows15 = data['15m'].map(c => c.low);
-    const closes15 = data['15m'].map(c => c.close);
-    const atr15 = calcAtr(highs15, lows15, closes15, 14);
-    const atrNow15 = atr15[atr15.length - 1];
-    const slBuffer = atrNow15 != null ? atrNow15 * Math.max(0, slAtrMult) : 0;
-    const tpMinAtr = atrNow15 != null ? atrNow15 * Math.max(0, tpAtrMult) : 0;
-    const minRiskAbs = entry * Math.max(0, Math.min(minRiskPct, 0.05));
-    const minTpAbs = entry * Math.max(0, Math.min(minTpPct, 0.2));
-
-    if (bias === 'BUY') {
-      const swing = recentSwingLow(data['15m'], lookback);
-      let sl = swing - slBuffer;
-      if (minRiskAbs > 0) sl = Math.min(sl, entry - minRiskAbs);
-      const risk = entry - sl;
-      const baseTp = entry + 2 * risk;
-      const tp = Math.max(baseTp, entry + Math.max(minTpAbs, tpMinAtr));
-      if (risk > 0) setup = { action: 'BUY', entry, sl, tp, rr: (tp - entry) / risk, reasons: { entryCheck, sltpMeta: { swing, slBuffer, atrNow15, lookback, minRiskPct, minTpPct, tpMinAtr } } };
+      if (bias === 'BUY') {
+        const swing5 = recentSwingLow(data['5m'], lookback5);
+        const sl = swing5 - slBuf;
+        const risk = entry - sl;
+        if (risk > 0) {
+          const rMult = Number(process.env.PULLBACK_TP_R_MULT ?? 2);
+          const rrMult = Math.max(0.8, Math.min(rMult, 4));
+          const tp = entry + rrMult * risk;
+          setup = {
+            action: 'BUY',
+            entry,
+            sl,
+            tp,
+            rr: (tp - entry) / risk,
+            reasons: { entryCheck, sltpMeta: { strategy, lookback5, swing5, atrNow5, slBuf, rrMult } },
+          };
+        }
+      } else {
+        const swing5 = recentSwingHigh(data['5m'], lookback5);
+        const sl = swing5 + slBuf;
+        const risk = sl - entry;
+        if (risk > 0) {
+          const rMult = Number(process.env.PULLBACK_TP_R_MULT ?? 2);
+          const rrMult = Math.max(0.8, Math.min(rMult, 4));
+          const tp = entry - rrMult * risk;
+          setup = {
+            action: 'SELL',
+            entry,
+            sl,
+            tp,
+            rr: (entry - tp) / risk,
+            reasons: { entryCheck, sltpMeta: { strategy, lookback5, swing5, atrNow5, slBuf, rrMult } },
+          };
+        }
+      }
     } else {
-      const swing = recentSwingHigh(data['15m'], lookback);
-      let sl = swing + slBuffer;
-      if (minRiskAbs > 0) sl = Math.max(sl, entry + minRiskAbs);
-      const risk = sl - entry;
-      const baseTp = entry - 2 * risk;
-      const tp = Math.min(baseTp, entry - Math.max(minTpAbs, tpMinAtr));
-      if (risk > 0) setup = { action: 'SELL', entry, sl, tp, rr: (entry - tp) / risk, reasons: { entryCheck, sltpMeta: { swing, slBuffer, atrNow15, lookback, minRiskPct, minTpPct, tpMinAtr } } };
+      // Default (legacy strict): swing-based SL/TP on 15m with ATR buffer
+      const lookback = Number(process.env.SL_SWING_LOOKBACK ?? 20);
+      const slAtrMult = Number(process.env.SL_ATR_MULT ?? 0.35);
+      const tpAtrMult = Number(process.env.TP_ATR_MULT ?? 0);
+      const minRiskPct = Number(process.env.MIN_RISK_PCT ?? 0);
+      const minTpPct = Number(process.env.MIN_TP_PCT ?? 0);
+
+      const highs15 = data['15m'].map(c => c.high);
+      const lows15 = data['15m'].map(c => c.low);
+      const closes15 = data['15m'].map(c => c.close);
+      const atr15 = calcAtr(highs15, lows15, closes15, 14);
+      const atrNow15 = atr15[atr15.length - 1];
+      const slBuffer = atrNow15 != null ? atrNow15 * Math.max(0, slAtrMult) : 0;
+      const tpMinAtr = atrNow15 != null ? atrNow15 * Math.max(0, tpAtrMult) : 0;
+      const minRiskAbs = entry * Math.max(0, Math.min(minRiskPct, 0.05));
+      const minTpAbs = entry * Math.max(0, Math.min(minTpPct, 0.2));
+
+      if (bias === 'BUY') {
+        const swing = recentSwingLow(data['15m'], lookback);
+        let sl = swing - slBuffer;
+        if (minRiskAbs > 0) sl = Math.min(sl, entry - minRiskAbs);
+        const risk = entry - sl;
+        const baseTp = entry + 2 * risk;
+        const tp = Math.max(baseTp, entry + Math.max(minTpAbs, tpMinAtr));
+        if (risk > 0) setup = { action: 'BUY', entry, sl, tp, rr: (tp - entry) / risk, reasons: { entryCheck, sltpMeta: { swing, slBuffer, atrNow15, lookback, minRiskPct, minTpPct, tpMinAtr } } };
+      } else {
+        const swing = recentSwingHigh(data['15m'], lookback);
+        let sl = swing + slBuffer;
+        if (minRiskAbs > 0) sl = Math.max(sl, entry + minRiskAbs);
+        const risk = sl - entry;
+        const baseTp = entry - 2 * risk;
+        const tp = Math.min(baseTp, entry - Math.max(minTpAbs, tpMinAtr));
+        if (risk > 0) setup = { action: 'SELL', entry, sl, tp, rr: (entry - tp) / risk, reasons: { entryCheck, sltpMeta: { swing, slBuffer, atrNow15, lookback, minRiskPct, minTpPct, tpMinAtr } } };
+      }
     }
   }
 
