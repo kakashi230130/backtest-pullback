@@ -94,14 +94,16 @@ function wickRejectionOk({ bias, c5, c15 }) {
 }
 
 function isEntrySignalStackedTrend({ bias, candles15, candles5 }) {
-  // STACKED_TREND_STRATEGY
+  // STACKED_TREND_STRATEGY (v3 refinements)
   // Trend filter (15m perfect order):
   // - BUY: MA20 > MA50 > MA200
   // - SELL: MA20 < MA50 < MA200
-  // Entry (mean reversion):
-  // - BUY: RSI15m < 50 but >= 35 AND RSI5m > 50
-  // - SELL: RSI15m > 50 but <= 65 AND RSI5m < 50
-  // No divergence / wick / ADX.
+  // MA200 slope guard:
+  // - BUY: ma200_now > ma200_10_candles_ago
+  // - SELL: ma200_now < ma200_10_candles_ago
+  // Entry (mean reversion + hysteresis):
+  // - BUY: RSI15m in [35,50) AND must have dipped < 42 recently, then RSI5m > 53
+  // - SELL: RSI15m in (50,65] AND must have spiked > 58 recently, then RSI5m < 47
 
   if (bias !== 'BUY' && bias !== 'SELL') return { ok: false, reason: 'BIAS_WAIT' };
 
@@ -119,21 +121,49 @@ function isEntrySignalStackedTrend({ bias, candles15, candles5 }) {
   if (bias === 'BUY' && !poBuy) return { ok: false, reason: 'PERFECT_ORDER_FAIL', details: { side: 'BUY' } };
   if (bias === 'SELL' && !poSell) return { ok: false, reason: 'PERFECT_ORDER_FAIL', details: { side: 'SELL' } };
 
+  // MA200 slope guard
+  const slopeBars = Number(process.env.STACKED_MA200_SLOPE_BARS ?? 10);
+  const n = Math.max(3, Math.min(slopeBars, 50));
+  if (candles15.length < n + 1) return { ok: false, reason: 'MA200_SLOPE_NOT_ENOUGH_BARS' };
+  const ma200Now = Number(candles15[candles15.length - 1].ma200);
+  const ma200Prev = Number(candles15[candles15.length - 1 - n].ma200);
+  if (!Number.isFinite(ma200Now) || !Number.isFinite(ma200Prev)) return { ok: false, reason: 'MA200_SLOPE_INVALID' };
+
+  if (bias === 'BUY' && !(ma200Now > ma200Prev)) return { ok: false, reason: 'MA200_SLOPE_GUARD_FAIL', details: { side: 'BUY', ma200Now, ma200Prev, n } };
+  if (bias === 'SELL' && !(ma200Now < ma200Prev)) return { ok: false, reason: 'MA200_SLOPE_GUARD_FAIL', details: { side: 'SELL', ma200Now, ma200Prev, n } };
+
   // RSI conditions
   const rsi15 = c15.rsi == null ? null : Number(c15.rsi);
   const rsi5 = c5.rsi == null ? null : Number(c5.rsi);
   if (!Number.isFinite(rsi15) || !Number.isFinite(rsi5)) return { ok: false, reason: 'NO_RSI' };
 
+  // RSI15 zone memory requirement
+  const zoneLookback = Number(process.env.STACKED_RSI15_ZONE_LOOKBACK ?? 24); // 24*15m = 6h
+  const lb = Math.max(4, Math.min(zoneLookback, 96));
+  const rsi15Slice = candles15.slice(Math.max(0, candles15.length - lb)).map(x => (x.rsi == null ? null : Number(x.rsi))).filter(Number.isFinite);
+
+  const buyDip = Number(process.env.STACKED_BUY_RSI15_DIP_BELOW ?? 42);
+  const sellSpike = Number(process.env.STACKED_SELL_RSI15_SPIKE_ABOVE ?? 58);
+
+  const hadBuyDip = rsi15Slice.some(v => v < buyDip);
+  const hadSellSpike = rsi15Slice.some(v => v > sellSpike);
+
+  // Hysteresis on RSI5
+  const buyRsi5Min = Number(process.env.STACKED_BUY_RSI5_CONFIRM ?? 53);
+  const sellRsi5Max = Number(process.env.STACKED_SELL_RSI5_CONFIRM ?? 47);
+
   if (bias === 'BUY') {
     if (!(rsi15 < 50 && rsi15 >= 35)) return { ok: false, reason: 'RSI15_NOT_IN_PULLBACK_ZONE', details: { rsi15 } };
-    if (!(rsi5 > 50)) return { ok: false, reason: 'RSI5_NOT_RECLAIM_50', details: { rsi5 } };
-    return { ok: true, mode: 'STACKED_TREND', details: { rsi15, rsi5 } };
+    if (!hadBuyDip) return { ok: false, reason: 'RSI15_NO_DIP_BELOW_THRESHOLD', details: { buyDip, lookback: lb } };
+    if (!(rsi5 > buyRsi5Min)) return { ok: false, reason: 'RSI5_NOT_RECLAIM_CONFIRM', details: { rsi5, buyRsi5Min } };
+    return { ok: true, mode: 'STACKED_TREND', details: { rsi15, rsi5, ma200Now, ma200Prev, hadBuyDip, lb } };
   }
 
   // SELL
   if (!(rsi15 > 50 && rsi15 <= 65)) return { ok: false, reason: 'RSI15_NOT_IN_PULLBACK_ZONE', details: { rsi15 } };
-  if (!(rsi5 < 50)) return { ok: false, reason: 'RSI5_NOT_DROP_BELOW_50', details: { rsi5 } };
-  return { ok: true, mode: 'STACKED_TREND', details: { rsi15, rsi5 } };
+  if (!hadSellSpike) return { ok: false, reason: 'RSI15_NO_SPIKE_ABOVE_THRESHOLD', details: { sellSpike, lookback: lb } };
+  if (!(rsi5 < sellRsi5Max)) return { ok: false, reason: 'RSI5_NOT_DROP_CONFIRM', details: { rsi5, sellRsi5Max } };
+  return { ok: true, mode: 'STACKED_TREND', details: { rsi15, rsi5, ma200Now, ma200Prev, hadSellSpike, lb } };
 }
 
 function isEntrySignalPullback({ bias, candles30, candles15, candles5 }) {
@@ -765,7 +795,7 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs }) {
       const k = Number(process.env.STACKED_SL_ATR_MULT ?? 2.0);
       const slDist = atrNow15 != null ? atrNow15 * Math.max(0, k) : null;
       if (slDist != null && slDist > 0) {
-        const rr = Number(process.env.STACKED_TP_RR ?? 1.5);
+        const rr = Number(process.env.STACKED_TP_RR ?? 2.0);
         const rrMult = Math.max(0.5, Math.min(rr, 5));
         if (bias === 'BUY') {
           const sl = entry - slDist;
