@@ -93,6 +93,49 @@ function wickRejectionOk({ bias, c5, c15 }) {
   return { ok, minPct };
 }
 
+function isEntrySignalStackedTrend({ bias, candles15, candles5 }) {
+  // STACKED_TREND_STRATEGY
+  // Trend filter (15m perfect order):
+  // - BUY: MA20 > MA50 > MA200
+  // - SELL: MA20 < MA50 < MA200
+  // Entry (mean reversion):
+  // - BUY: RSI15m < 50 but >= 35 AND RSI5m > 50
+  // - SELL: RSI15m > 50 but <= 65 AND RSI5m < 50
+  // No divergence / wick / ADX.
+
+  if (bias !== 'BUY' && bias !== 'SELL') return { ok: false, reason: 'BIAS_WAIT' };
+
+  const c15 = last(candles15);
+  const c5 = last(candles5);
+  if (!c15 || !c5) return { ok: false, reason: 'MISSING_CANDLES' };
+
+  if (c15.ma20 == null || c15.ma50 == null || c15.ma200 == null) {
+    return { ok: false, reason: 'MISSING_MA_15M' };
+  }
+
+  const poBuy = Number(c15.ma20) > Number(c15.ma50) && Number(c15.ma50) > Number(c15.ma200);
+  const poSell = Number(c15.ma20) < Number(c15.ma50) && Number(c15.ma50) < Number(c15.ma200);
+
+  if (bias === 'BUY' && !poBuy) return { ok: false, reason: 'PERFECT_ORDER_FAIL', details: { side: 'BUY' } };
+  if (bias === 'SELL' && !poSell) return { ok: false, reason: 'PERFECT_ORDER_FAIL', details: { side: 'SELL' } };
+
+  // RSI conditions
+  const rsi15 = c15.rsi == null ? null : Number(c15.rsi);
+  const rsi5 = c5.rsi == null ? null : Number(c5.rsi);
+  if (!Number.isFinite(rsi15) || !Number.isFinite(rsi5)) return { ok: false, reason: 'NO_RSI' };
+
+  if (bias === 'BUY') {
+    if (!(rsi15 < 50 && rsi15 >= 35)) return { ok: false, reason: 'RSI15_NOT_IN_PULLBACK_ZONE', details: { rsi15 } };
+    if (!(rsi5 > 50)) return { ok: false, reason: 'RSI5_NOT_RECLAIM_50', details: { rsi5 } };
+    return { ok: true, mode: 'STACKED_TREND', details: { rsi15, rsi5 } };
+  }
+
+  // SELL
+  if (!(rsi15 > 50 && rsi15 <= 65)) return { ok: false, reason: 'RSI15_NOT_IN_PULLBACK_ZONE', details: { rsi15 } };
+  if (!(rsi5 < 50)) return { ok: false, reason: 'RSI5_NOT_DROP_BELOW_50', details: { rsi5 } };
+  return { ok: true, mode: 'STACKED_TREND', details: { rsi15, rsi5 } };
+}
+
 function isEntrySignalPullback({ bias, candles30, candles15, candles5 }) {
   // PULLBACK_STRATEGY (refined):
   // - Trend must be strong enough: ADX(15m) >= min
@@ -408,6 +451,10 @@ export function isEntrySignalV2({ bias, candles30, candles15, candles5 }) {
     return isEntrySignalPullback({ bias, candles30, candles15, candles5 });
   }
 
+  if (strategy === 'STACKED_TREND_STRATEGY') {
+    return isEntrySignalStackedTrend({ bias, candles15, candles5 });
+  }
+
   if (bias !== 'BUY' && bias !== 'SELL') return { ok: false, reason: 'BIAS_WAIT' };
 
   const easyMode = process.env.ANALYZE_EASY_MODE === '1';
@@ -705,11 +752,38 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs }) {
     const offsetPct = Math.min(Math.max(offsetPctRaw, 0), Math.max(offsetMaxRaw, 0));
     const entry = bias === 'BUY' ? base * (1 - offsetPct) : base * (1 + offsetPct);
 
-    // If using PULLBACK_STRATEGY, use ATR-based dynamic SL per new requirement:
-    // SL = SwingLow - k*ATR(5m)  (BUY)
-    // SL = SwingHigh + k*ATR(5m) (SELL)
+    // Strategy-specific SL/TP
     const strategy = String(process.env.ANALYZE_STRATEGY ?? 'DEFAULT').toUpperCase();
-    if (strategy === 'PULLBACK_STRATEGY') {
+
+    if (strategy === 'STACKED_TREND_STRATEGY') {
+      // ATR dynamic (15m): SL = entry +/- 2.0*ATR15, TP = 1:1.5 RR
+      const highs15 = data['15m'].map(c => c.high);
+      const lows15 = data['15m'].map(c => c.low);
+      const closes15 = data['15m'].map(c => c.close);
+      const atr15 = calcAtr(highs15, lows15, closes15, 14);
+      const atrNow15 = atr15[atr15.length - 1];
+      const k = Number(process.env.STACKED_SL_ATR_MULT ?? 2.0);
+      const slDist = atrNow15 != null ? atrNow15 * Math.max(0, k) : null;
+      if (slDist != null && slDist > 0) {
+        const rr = Number(process.env.STACKED_TP_RR ?? 1.5);
+        const rrMult = Math.max(0.5, Math.min(rr, 5));
+        if (bias === 'BUY') {
+          const sl = entry - slDist;
+          const risk = entry - sl;
+          const tp = entry + rrMult * risk;
+          if (risk > 0) {
+            setup = { action: 'BUY', entry, sl, tp, rr: rrMult, reasons: { entryCheck, sltpMeta: { strategy, atrNow15, slDist, rrMult } } };
+          }
+        } else {
+          const sl = entry + slDist;
+          const risk = sl - entry;
+          const tp = entry - rrMult * risk;
+          if (risk > 0) {
+            setup = { action: 'SELL', entry, sl, tp, rr: rrMult, reasons: { entryCheck, sltpMeta: { strategy, atrNow15, slDist, rrMult } } };
+          }
+        }
+      }
+    } else if (strategy === 'PULLBACK_STRATEGY') {
       const lookback5 = Number(process.env.PULLBACK_SWING_LOOKBACK_5M ?? 30);
       const highs5 = data['5m'].map(c => c.high);
       const lows5 = data['5m'].map(c => c.low);
