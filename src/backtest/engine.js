@@ -210,53 +210,24 @@ export function runBacktest({
     // 2) If position open: trailing/breakeven (by CLOSE), then check SL/TP hits; conservative SL-first if both
     let unrealized = 0;
     if (open) {
-      // Trailing stop: use option A (Close) for conservative mark-to-market + consistent with your choice.
-      const mv = maybeMoveStopLoss({
-        side: open.side,
-        entry: open.entryFill,
-        initialSl: open.initialSl,
-        currentSl: open.currentSl,
-        price: c5.close,
-      });
-      if (mv.newSl != null) {
-        // tighten only
-        if (open.side === 'LONG') open.currentSl = Math.max(open.currentSl, mv.newSl);
-        else open.currentSl = Math.min(open.currentSl, mv.newSl);
-      }
+      const strategy = String(open?.meta?.setup?.reasons?.sltpMeta?.strategy ?? open?.meta?.setup?.reasons?.sltpMeta?.strategy ?? '').toUpperCase();
+      const wantPTP = (process.env.BACKTEST_PTP_ENABLED ?? '1') === '1' && String(process.env.ANALYZE_STRATEGY ?? '').toUpperCase() === 'STACKED_TREND_STRATEGY';
 
       // Mark-to-market equity (Unrealized PnL) for accurate drawdown.
       unrealized = pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: c5.close, qty: open.qty });
 
+      // Conservative SL-first rule always applies.
       const hitSL = open.side === 'LONG'
         ? (c5.low <= open.currentSl)
         : (c5.high >= open.currentSl);
-      const hitTP = open.side === 'LONG'
-        ? (c5.high >= open.tp)
-        : (c5.low <= open.tp);
 
-      let exitReason = null;
-      let exitPrice = null;
-
-      if (hitSL || hitTP) {
-        if (hitSL && hitTP) {
-          // conservative
-          exitReason = 'SL';
-          exitPrice = open.currentSl;
-        } else if (hitSL) {
-          exitReason = 'SL';
-          exitPrice = open.currentSl;
-        } else {
-          exitReason = 'TP';
-          exitPrice = open.tp;
-        }
-
-        const exitFill = applySlippage({ side: open.side, price: exitPrice, slippagePct });
+      if (hitSL) {
+        // full stop-out (no partial processing)
+        const exitFill = applySlippage({ side: open.side, price: open.currentSl, slippagePct });
         const notionalOut = exitFill * open.qty;
         const feeOut = calcFee({ notional: notionalOut, feeRate });
-
         const gross = pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: exitFill, qty: open.qty });
         const net = gross - open.fees - feeOut;
-
         balance += net;
         equity = balance;
 
@@ -271,7 +242,7 @@ export function runBacktest({
           sl_initial: open.initialSl,
           sl_final: open.currentSl,
           tp: open.tp,
-          reason: exitReason,
+          reason: 'SL',
           grossPnl: gross,
           fees: open.fees + feeOut,
           netPnl: net,
@@ -282,6 +253,177 @@ export function runBacktest({
 
         open = null;
         unrealized = 0;
+      } else {
+        // No SL hit: process partial TP (if enabled) then final TP.
+        if (wantPTP) {
+          // initialize PTP state
+          if (open.ptp == null) {
+            const R = Math.abs(open.entryFill - open.initialSl);
+            open.ptp = {
+              R,
+              partialDone: false,
+              partialPrice: open.side === 'LONG' ? (open.entryFill + R) : (open.entryFill - R),
+              finalPrice: open.side === 'LONG' ? (open.entryFill + 2 * R) : (open.entryFill - 2 * R),
+            };
+          }
+
+          // 1) Partial at +1R: close 50%
+          if (!open.ptp.partialDone) {
+            const hitPartial = open.side === 'LONG'
+              ? (c5.high >= open.ptp.partialPrice)
+              : (c5.low <= open.ptp.partialPrice);
+
+            if (hitPartial) {
+              const closeQty = open.qty * 0.5;
+              const exitFill = applySlippage({ side: open.side, price: open.ptp.partialPrice, slippagePct });
+              const notionalOut = exitFill * closeQty;
+              const feeOut = calcFee({ notional: notionalOut, feeRate });
+              const gross = pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: exitFill, qty: closeQty });
+              const net = gross - feeOut;
+              balance += net;
+
+              open.qty -= closeQty;
+              open.ptp.partialDone = true;
+
+              // Hard breakeven for remaining 50%: move SL to entry +/- fees buffer.
+              // Approximate fee buffer: entry * feeRate * 2 (entry+exit)
+              const feeBuf = open.entryFill * clamp(feeRate, 0, 0.01) * 2;
+              const be = open.side === 'LONG' ? (open.entryFill + feeBuf) : (open.entryFill - feeBuf);
+              open.currentSl = be;
+
+              // After partial, in same candle we conservatively allow BE stop to trigger.
+              const hitBeSame = open.side === 'LONG'
+                ? (c5.low <= open.currentSl)
+                : (c5.high >= open.currentSl);
+
+              if (hitBeSame) {
+                const exitFill2 = applySlippage({ side: open.side, price: open.currentSl, slippagePct });
+                const notionalOut2 = exitFill2 * open.qty;
+                const feeOut2 = calcFee({ notional: notionalOut2, feeRate });
+                const gross2 = pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: exitFill2, qty: open.qty });
+                const net2 = gross2 - feeOut2;
+                balance += net2;
+
+                trades.push({
+                  symbol,
+                  side: open.side,
+                  entry_time: open.entryTime,
+                  exit_time: c5.open_time,
+                  entry: open.entryFill,
+                  exit: exitFill2,
+                  qty: open.qty + closeQty, // original size
+                  sl_initial: open.initialSl,
+                  sl_final: open.currentSl,
+                  tp: open.ptp.finalPrice,
+                  reason: 'PTP_1R_THEN_BE',
+                  grossPnl: gross + gross2,
+                  fees: open.fees + feeOut + feeOut2,
+                  netPnl: (gross + gross2) - open.fees - feeOut - feeOut2,
+                  leverage,
+                  margin_used: (open.entryFill * (open.qty + closeQty)) / Math.max(1, Number(leverage) || 1),
+                  meta: { ...open.meta, ptp: open.ptp },
+                });
+
+                open = null;
+                unrealized = 0;
+              }
+            }
+          }
+
+          // 2) Final TP at +2R for remaining size
+          if (open && open.ptp?.partialDone) {
+            const hitFinal = open.side === 'LONG'
+              ? (c5.high >= open.ptp.finalPrice)
+              : (c5.low <= open.ptp.finalPrice);
+
+            if (hitFinal) {
+              const exitFill = applySlippage({ side: open.side, price: open.ptp.finalPrice, slippagePct });
+              const notionalOut = exitFill * open.qty;
+              const feeOut = calcFee({ notional: notionalOut, feeRate });
+              const gross = pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: exitFill, qty: open.qty });
+              const net = gross - open.fees - feeOut;
+              balance += net;
+              equity = balance;
+
+              trades.push({
+                symbol,
+                side: open.side,
+                entry_time: open.entryTime,
+                exit_time: c5.open_time,
+                entry: open.entryFill,
+                exit: exitFill,
+                qty: open.qty,
+                sl_initial: open.initialSl,
+                sl_final: open.currentSl,
+                tp: open.ptp.finalPrice,
+                reason: 'TP_2R_AFTER_PTP',
+                grossPnl: gross,
+                fees: open.fees + feeOut,
+                netPnl: net,
+                leverage,
+                margin_used: (open.entryFill * open.qty) / Math.max(1, Number(leverage) || 1),
+                meta: { ...open.meta, ptp: open.ptp },
+              });
+
+              open = null;
+              unrealized = 0;
+            }
+          }
+
+          // If open still exists and partial not enabled/filled, we do not use old trailing.
+        } else {
+          // Legacy trailing/breakeven logic
+          const mv = maybeMoveStopLoss({
+            side: open.side,
+            entry: open.entryFill,
+            initialSl: open.initialSl,
+            currentSl: open.currentSl,
+            price: c5.close,
+          });
+          if (mv.newSl != null) {
+            if (open.side === 'LONG') open.currentSl = Math.max(open.currentSl, mv.newSl);
+            else open.currentSl = Math.min(open.currentSl, mv.newSl);
+          }
+
+          const hitTP = open.side === 'LONG'
+            ? (c5.high >= open.tp)
+            : (c5.low <= open.tp);
+
+          if (hitTP) {
+            const exitFill = applySlippage({ side: open.side, price: open.tp, slippagePct });
+            const notionalOut = exitFill * open.qty;
+            const feeOut = calcFee({ notional: notionalOut, feeRate });
+
+            const gross = pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: exitFill, qty: open.qty });
+            const net = gross - open.fees - feeOut;
+
+            balance += net;
+            equity = balance;
+
+            trades.push({
+              symbol,
+              side: open.side,
+              entry_time: open.entryTime,
+              exit_time: c5.open_time,
+              entry: open.entryFill,
+              exit: exitFill,
+              qty: open.qty,
+              sl_initial: open.initialSl,
+              sl_final: open.currentSl,
+              tp: open.tp,
+              reason: 'TP',
+              grossPnl: gross,
+              fees: open.fees + feeOut,
+              netPnl: net,
+              leverage,
+              margin_used: (open.entryFill * open.qty) / Math.max(1, Number(leverage) || 1),
+              meta: open.meta ?? null,
+            });
+
+            open = null;
+            unrealized = 0;
+          }
+        }
       }
     }
 

@@ -93,8 +93,8 @@ function wickRejectionOk({ bias, c5, c15 }) {
   return { ok, minPct };
 }
 
-function isEntrySignalStackedTrend({ bias, candles15, candles5 }) {
-  // STACKED_TREND_STRATEGY (v3 refinements)
+function isEntrySignalStackedTrend({ bias, candles15, candles5, candles1h }) {
+  // STACKED_TREND_STRATEGY (v4 refinements)
   // Trend filter (15m perfect order):
   // - BUY: MA20 > MA50 > MA200
   // - SELL: MA20 < MA50 < MA200
@@ -121,8 +121,8 @@ function isEntrySignalStackedTrend({ bias, candles15, candles5 }) {
   if (bias === 'BUY' && !poBuy) return { ok: false, reason: 'PERFECT_ORDER_FAIL', details: { side: 'BUY' } };
   if (bias === 'SELL' && !poSell) return { ok: false, reason: 'PERFECT_ORDER_FAIL', details: { side: 'SELL' } };
 
-  // MA200 slope guard
-  const slopeBars = Number(process.env.STACKED_MA200_SLOPE_BARS ?? 10);
+  // MA200 slope guard (longer lookback to avoid short-term noise)
+  const slopeBars = Number(process.env.STACKED_MA200_SLOPE_BARS ?? 30);
   const n = Math.max(3, Math.min(slopeBars, 50));
   if (candles15.length < n + 1) return { ok: false, reason: 'MA200_SLOPE_NOT_ENOUGH_BARS' };
   const ma200Now = Number(candles15[candles15.length - 1].ma200);
@@ -131,6 +131,21 @@ function isEntrySignalStackedTrend({ bias, candles15, candles5 }) {
 
   if (bias === 'BUY' && !(ma200Now > ma200Prev)) return { ok: false, reason: 'MA200_SLOPE_GUARD_FAIL', details: { side: 'BUY', ma200Now, ma200Prev, n } };
   if (bias === 'SELL' && !(ma200Now < ma200Prev)) return { ok: false, reason: 'MA200_SLOPE_GUARD_FAIL', details: { side: 'SELL', ma200Now, ma200Prev, n } };
+
+  // 1H ADX filter (trend strength confirmation on higher TF)
+  const adxMin1h = Number(process.env.STACKED_ADX1H_MIN ?? 20);
+  if (adxMin1h > 0) {
+    const arr1h = candles1h ?? [];
+    if (arr1h.length < 40) return { ok: false, reason: 'ADX1H_NOT_ENOUGH_BARS' };
+    const highs1h = arr1h.map(c => c.high);
+    const lows1h = arr1h.map(c => c.low);
+    const closes1h = arr1h.map(c => c.close);
+    const adx1h = calcAdx(highs1h, lows1h, closes1h, 14);
+    const adxNow1h = adx1h[adx1h.length - 1];
+    if (adxNow1h == null || adxNow1h < adxMin1h) {
+      return { ok: false, reason: 'ADX1H_TOO_LOW', details: { adxNow1h, adxMin1h } };
+    }
+  }
 
   // RSI conditions
   const rsi15 = c15.rsi == null ? null : Number(c15.rsi);
@@ -473,7 +488,7 @@ function rsiDivergence({ candles, rsiArr, type }) {
   return { ok: false };
 }
 
-export function isEntrySignalV2({ bias, candles30, candles15, candles5 }) {
+export function isEntrySignalV2({ bias, candles30, candles15, candles5, candles1h = null }) {
   const profile = (process.env.ANALYZE_PROFILE ?? 'strict').toLowerCase();
   const strategy = String(process.env.ANALYZE_STRATEGY ?? 'DEFAULT').toUpperCase();
 
@@ -482,7 +497,7 @@ export function isEntrySignalV2({ bias, candles30, candles15, candles5 }) {
   }
 
   if (strategy === 'STACKED_TREND_STRATEGY') {
-    return isEntrySignalStackedTrend({ bias, candles15, candles5 });
+    return isEntrySignalStackedTrend({ bias, candles15, candles5, candles1h: candles1h ?? [] });
   }
 
   if (bias !== 'BUY' && bias !== 'SELL') return { ok: false, reason: 'BIAS_WAIT' };
@@ -712,7 +727,13 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs }) {
     else if (trend1d === 'BEAR') bias = 'SELL';
   }
 
-  let entryCheck = isEntrySignalV2({ bias, candles30: data['30m'], candles15: data['15m'], candles5: data['5m'] });
+  let entryCheck = isEntrySignalV2({
+    bias,
+    candles30: data['30m'],
+    candles15: data['15m'],
+    candles5: data['5m'],
+    candles1h: data['1h'],
+  });
   const easyMode = process.env.ANALYZE_EASY_MODE === '1';
 
   let setup = null;
