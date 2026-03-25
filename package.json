@@ -16,7 +16,9 @@
     "analyze": "node src/analyzeAndAct.js",
     "analyze:30m": "node src/analyzeScheduler.js",
     "sample:order": "node src/sampleOrder.js",
-    "backtest": "node src/backtest/run.js"
+    "backtest": "node src/backtest/run.js",
+    "aggregate:from5m": "node src/aggregateFrom5m.js",
+    "backfill:range": "node src/backfillRange.js"
   },
   "keywords": ["binance", "klines", "candles", "mysql", "cron"],
   "author": "",

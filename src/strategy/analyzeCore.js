@@ -608,6 +608,7 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs }) {
     snapshots: { c5, c15, c30, c1h, c4h, c1d },
     trends: { trend1d, trend4h, trend1h },
     bias,
+    entryCheck,
     setup,
     reentryReversal,
   };

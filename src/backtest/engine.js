@@ -105,6 +105,7 @@ export function runBacktest({
   slippagePct = 0,
   data, // { '5m': [...], '15m': [...], ... }
   indicatorsFromDb = true,
+  debug = false,
 }) {
   if (!symbol) throw new Error('symbol required');
 
@@ -128,11 +129,33 @@ export function runBacktest({
   let i0 = candles5.findIndex(c => c.open_time >= start);
   if (i0 < 0) i0 = candles5.length;
 
+  // balance: realized account value (after fees, after closed trades)
+  // equity: mark-to-market = balance + unrealized PnL (for open positions)
   let equity = Number(initialBalance);
   let balance = Number(initialBalance);
 
   const equityCurve = [];
   const trades = [];
+
+  const debugStats = {
+    bars_total: 0,
+    analysis_null: 0,
+    bias_wait: 0,
+    bias_buy: 0,
+    bias_sell: 0,
+    entry_ok: 0,
+    entry_fail: 0,
+    setup_null: 0,
+    setup_rr_lt_0: 0,
+    pending_created: 0,
+    pending_filled: 0,
+    pending_never_filled: 0,
+    margin_reject: 0,
+    // top reasons from entryCheck
+    entry_reasons: {},
+    // how often indicators missing at HTF snapshots
+    htf_missing: { '1h': 0, '4h': 0, '1d': 0 },
+  };
 
   let open = null; // current position/trade state
   let pending = null; // pending limit entry state
@@ -142,15 +165,18 @@ export function runBacktest({
   for (let i = i0; i < candles5.length; i++) {
     const c5 = candles5[i];
     if (c5.open_time > end) break;
+    debugStats.bars_total += 1;
 
-    const nowMs = c5.open_time + stepMs; // treat as candle close time for staleness checks
+    const nowMs = c5.open_time + stepMs; // current 5m candle close time
 
-    // Advance pointers for each tf: include candles with open_time <= current 5m open_time
+    // Advance pointers for each tf using ONLY fully-closed candles (no-lookahead).
+    // A candle is considered "available" only when: open_time + tfMs <= nowMs.
     const snapData = {};
     for (const itv of INTERVALS) {
       const arr = data[itv] ?? [];
+      const tfMs = msForInterval(itv);
       let p = ptr[itv];
-      while (p < arr.length && arr[p].open_time <= c5.open_time) p++;
+      while (p < arr.length && (arr[p].open_time + tfMs) <= nowMs) p++;
       ptr[itv] = p;
       snapData[itv] = arr.slice(0, p);
     }
@@ -159,6 +185,7 @@ export function runBacktest({
     if (pending) {
       const filled = candleHitsPrice(c5, pending.entryPrice);
       if (filled) {
+        debugStats.pending_filled += 1;
         const entryFill = applySlippage({ side: pending.side, price: pending.entryPrice, slippagePct });
         const notional = entryFill * pending.qty;
         const feeIn = calcFee({ notional, feeRate });
@@ -180,9 +207,10 @@ export function runBacktest({
       }
     }
 
-    // 2) If position open: check SL/TP hit on this candle; conservative SL-first if both
+    // 2) If position open: trailing/breakeven (by CLOSE), then check SL/TP hits; conservative SL-first if both
+    let unrealized = 0;
     if (open) {
-      // Update trailing/breakeven based on close price (proxy for mark price)
+      // Trailing stop: use option A (Close) for conservative mark-to-market + consistent with your choice.
       const mv = maybeMoveStopLoss({
         side: open.side,
         entry: open.entryFill,
@@ -195,6 +223,9 @@ export function runBacktest({
         if (open.side === 'LONG') open.currentSl = Math.max(open.currentSl, mv.newSl);
         else open.currentSl = Math.min(open.currentSl, mv.newSl);
       }
+
+      // Mark-to-market equity (Unrealized PnL) for accurate drawdown.
+      unrealized = pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: c5.close, qty: open.qty });
 
       const hitSL = open.side === 'LONG'
         ? (c5.low <= open.currentSl)
@@ -250,12 +281,39 @@ export function runBacktest({
         });
 
         open = null;
+        unrealized = 0;
       }
     }
 
     // 3) If no open and no pending: run strategy at this time and possibly place LIMIT entry
     if (!open && !pending) {
       const analysis = analyzeSymbolFromCandles({ symbol, data: snapData, nowMs });
+      if (!analysis) {
+        debugStats.analysis_null += 1;
+      } else {
+        if (analysis.bias === 'WAIT') debugStats.bias_wait += 1;
+        if (analysis.bias === 'BUY') debugStats.bias_buy += 1;
+        if (analysis.bias === 'SELL') debugStats.bias_sell += 1;
+        if (!analysis.setup) debugStats.setup_null += 1;
+
+        // Track HTF indicator availability
+        const s1h = analysis.snapshots?.c1h;
+        const s4h = analysis.snapshots?.c4h;
+        const s1d = analysis.snapshots?.c1d;
+        if (s1h?.ma20 == null || s1h?.ma50 == null || s1h?.rsi == null) debugStats.htf_missing['1h'] += 1;
+        if (s4h?.ma20 == null || s4h?.ma50 == null || s4h?.rsi == null) debugStats.htf_missing['4h'] += 1;
+        if (s1d?.ma20 == null || s1d?.ma50 == null || s1d?.rsi == null) debugStats.htf_missing['1d'] += 1;
+
+        const ec = analysis.entryCheck;
+        if (ec?.ok) debugStats.entry_ok += 1;
+        else debugStats.entry_fail += 1;
+
+        const reason = ec?.reason;
+        if (reason) {
+          debugStats.entry_reasons[reason] = (debugStats.entry_reasons[reason] ?? 0) + 1;
+        }
+      }
+
       const setup = analysis?.setup;
 
       if (setup && (setup.action === 'BUY' || setup.action === 'SELL')) {
@@ -270,10 +328,10 @@ export function runBacktest({
           const risk$ = balance * clamp(riskPerTrade, 0, 1);
           const qty = risk$ / stopDist;
 
-          // Margin check (leverage affects margin only). If insufficient balance, skip.
           const notional = entry * qty;
           const marginNeed = notional / Math.max(1, Number(leverage) || 1);
           if (marginNeed <= balance && qty > 0) {
+            debugStats.pending_created += 1;
             pending = {
               side,
               entryPrice: entry,
@@ -290,22 +348,35 @@ export function runBacktest({
                 },
               },
             };
+          } else {
+            debugStats.margin_reject += 1;
           }
+        } else {
+          debugStats.setup_rr_lt_0 += 1;
         }
       }
     }
 
     // Equity curve point at candle close
+    // Include unrealized PnL for accurate drawdown math.
+    const equityMtM = balance + (open ? pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: c5.close, qty: open.qty }) : 0);
+    equity = equityMtM;
+
     equityCurve.push({
       time: nowMs,
-      equity,
+      equity: equityMtM,
       balance,
+      unrealized_pnl: equityMtM - balance,
       open_position: open ? { side: open.side, entry: open.entryFill, sl: open.currentSl, tp: open.tp, qty: open.qty } : null,
       pending_entry: pending ? { side: pending.side, entry: pending.entryPrice, qty: pending.qty } : null,
+      close: c5.close,
     });
   }
 
+  // If a pending entry never fills by end of test window, track it.
+  if (pending) debugStats.pending_never_filled += 1;
+
   const summary = buildBacktestSummary({ trades, equityCurve, initialBalance });
 
-  return { summary, trades, equity_curve: equityCurve };
+  return { summary, trades, equity_curve: equityCurve, debug: debug ? debugStats : undefined };
 }

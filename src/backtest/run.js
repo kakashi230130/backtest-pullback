@@ -60,6 +60,8 @@ async function main() {
     warmupMs,
   });
 
+  const debug = String(args.debug ?? process.env.BACKTEST_DEBUG ?? '0') === '1';
+
   const result = runBacktest({
     symbol,
     startTime,
@@ -71,6 +73,7 @@ async function main() {
     slippagePct,
     data,
     indicatorsFromDb,
+    debug,
   });
 
   const outPath = args.out ?? null;
@@ -85,6 +88,7 @@ async function main() {
     summary: result.summary,
     trades: result.trades.length,
     equity_points: result.equity_curve.length,
+    debug: debug ? result.debug : undefined,
     out: outPath ?? null,
   }, null, 2));
 }
