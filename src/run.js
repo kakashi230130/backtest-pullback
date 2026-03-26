@@ -34,9 +34,15 @@ function parseTimeMs(x) {
 async function main() {
   const args = parseArgs(process.argv);
 
-  const symbol = args.symbol ?? process.env.BACKTEST_SYMBOL;
-  const startTime = parseTimeMs(args.start ?? args.startTime ?? process.env.BACKTEST_START_TIME);
-  const endTime = parseTimeMs(args.end ?? args.endTime ?? process.env.BACKTEST_END_TIME);
+  // Support both flag-style args:
+  //   --symbol BTCUSDT --start ... --end ... --out output/result.json
+  // and positional args (some npm setups strip leading --flags when forwarding):
+  //   BTCUSDT 2025-01-01T00:00:00Z 2026-01-01T00:00:00Z output/result.json
+  const positional = process.argv.slice(2).filter(a => !String(a).startsWith('--'));
+
+  const symbol = args.symbol ?? positional[0] ?? process.env.BACKTEST_SYMBOL;
+  const startTime = parseTimeMs(args.start ?? args.startTime ?? positional[1] ?? process.env.BACKTEST_START_TIME);
+  const endTime = parseTimeMs(args.end ?? args.endTime ?? positional[2] ?? process.env.BACKTEST_END_TIME);
 
   if (!symbol) throw new Error('Missing --symbol');
   if (!startTime) throw new Error('Missing --start (ms or ISO)');
@@ -74,7 +80,7 @@ async function main() {
     debug,
   });
 
-  const outPath = args.out ?? null;
+  const outPath = args.out ?? positional[3] ?? null;
   if (outPath) {
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     fs.writeFileSync(outPath, JSON.stringify(result, null, 2));
