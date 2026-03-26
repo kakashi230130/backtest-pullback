@@ -1,35 +1,16 @@
 {
-  "name": "binance-candles-backend",
-  "version": "1.0.0",
+  "name": "crypto-backtest-minimal",
+  "version": "0.1.0",
+  "private": true,
   "type": "module",
-  "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "migrate": "node src/migrate.js && node src/migrate_v2_indicators.js && node src/migrate_v3_open_trades.js && node src/migrate_v4_trade_orders.js",
-    "sync:5m": "node src/runOnce.js 5m",
-    "sync:15m": "node src/runOnce.js 15m",
-    "sync:30m": "node src/runOnce.js 30m",
-    "sync:1h": "node src/runOnce.js 1h",
-    "sync:4h": "node src/runOnce.js 4h",
-    "sync:1d": "node src/runOnce.js 1d",
-    "backfill:latest200": "node src/backfillLatest200.js",
-    "analyze": "node src/analyzeAndAct.js",
-    "analyze:30m": "node src/analyzeScheduler.js",
-    "sample:order": "node src/sampleOrder.js",
-    "backtest": "node src/backtest/run.js",
-    "aggregate:from5m": "node src/aggregateFrom5m.js",
-    "backfill:range": "node src/backfillRange.js"
+    "backtest": "node src/run.js",
+    "backfill:range": "node src/backfillRange.js",
+    "aggregate:from5m": "node src/aggregateFrom5m.js"
   },
-  "keywords": ["binance", "klines", "candles", "mysql", "cron"],
-  "author": "",
-  "license": "ISC",
-  "description": "Fetch and store Binance candlesticks into MySQL",
   "dependencies": {
     "axios": "^1.13.6",
     "dotenv": "^17.3.1",
-    "mysql2": "^3.20.0",
-    "node-cron": "^4.2.1",
-    "pino": "^10.3.1",
-    "pino-pretty": "^13.1.3"
+    "mysql2": "^3.20.0"
   }
 }

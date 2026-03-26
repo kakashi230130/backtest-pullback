@@ -1,19 +1,6 @@
 import { pool } from './db.js';
 
 export function mapKline(symbol, interval, k) {
-  // Binance kline array format:
-  // 0 open time
-  // 1 open
-  // 2 high
-  // 3 low
-  // 4 close
-  // 5 volume
-  // 6 close time
-  // 7 quote asset volume
-  // 8 number of trades
-  // 9 taker buy base asset volume
-  // 10 taker buy quote asset volume
-  // 11 ignore
   return {
     symbol,
     interval_code: interval,
@@ -29,7 +16,6 @@ export function mapKline(symbol, interval, k) {
     taker_buy_base_asset_volume: k[9],
     taker_buy_quote_asset_volume: k[10],
     is_closed: 1,
-    // indicators (nullable)
     rsi: null,
     ma20: null,
     ma50: null,
@@ -40,8 +26,6 @@ export function mapKline(symbol, interval, k) {
 export async function upsertCandles(rows) {
   if (!rows.length) return { insertedOrUpdated: 0 };
 
-  // Bulk insert with ON DUPLICATE KEY UPDATE
-  // Note: mysql2 supports array-of-arrays.
   const cols = [
     'symbol',
     'interval_code',
@@ -91,14 +75,6 @@ export async function upsertCandles(rows) {
   return { insertedOrUpdated: result.affectedRows ?? 0 };
 }
 
-export async function getLastOpenTime(symbol, interval) {
-  const [rows] = await pool.query(
-    `SELECT open_time FROM candles WHERE symbol=:symbol AND interval_code=:interval ORDER BY open_time DESC LIMIT 1`,
-    { symbol, interval },
-  );
-  return rows.length ? Number(rows[0].open_time) : null;
-}
-
 export async function getRecentClosesBefore(symbol, interval, beforeOpenTime, limit = 250) {
   const [rows] = await pool.query(
     `
@@ -113,7 +89,6 @@ export async function getRecentClosesBefore(symbol, interval, beforeOpenTime, li
     { symbol, interval, beforeOpenTime },
   );
 
-  // rows are DESC; return ASC
   return rows
     .map(r => ({ open_time: Number(r.open_time), close: Number(r.close) }))
     .sort((a, b) => a.open_time - b.open_time);

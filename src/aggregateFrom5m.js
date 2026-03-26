@@ -1,9 +1,9 @@
 import 'dotenv/config';
+
 import { pool } from './db.js';
 import { upsertCandles, getRecentClosesBefore } from './candlesRepo.js';
 import { intervalToMs } from './intervals.js';
 import { addIndicatorsToCandleRows } from './indicators.js';
-import { logger } from './logger.js';
 
 function parseArgs(argv) {
   const out = {};
@@ -92,10 +92,9 @@ function aggregateBuckets({ symbol, baseRows, targetInterval }) {
     if (!buf.length) return;
     if (buf.length !== need) {
       buf = [];
-      return; // incomplete bucket, skip
+      return;
     }
 
-    // Ensure contiguous expected open_times to avoid aggregating over gaps
     for (let i = 1; i < buf.length; i++) {
       if (buf[i].open_time !== buf[i - 1].open_time + baseMs) {
         buf = [];
@@ -166,7 +165,6 @@ function aggregateBuckets({ symbol, baseRows, targetInterval }) {
 async function addIndicators({ symbol, interval, rows }) {
   if (!rows.length) return rows;
 
-  // Warmup from existing interval candles (if present)
   const warmup = await getRecentClosesBefore(symbol, interval, rows[0].open_time, 260);
   const combined = [
     ...warmup.map(w => ({ close: Number(w.close) })),
@@ -178,7 +176,6 @@ async function addIndicators({ symbol, interval, rows }) {
   const offset = combined.length - rows.length;
   for (let i = 0; i < rows.length; i++) {
     const c = combined[offset + i];
-    // match syncCandles behavior (DECIMAL-friendly)
     rows[i].rsi = c.rsi == null ? null : Number(c.rsi).toFixed(8);
     rows[i].ma20 = c.ma20 == null ? null : Number(c.ma20).toFixed(8);
     rows[i].ma50 = c.ma50 == null ? null : Number(c.ma50).toFixed(8);
@@ -190,7 +187,7 @@ async function addIndicators({ symbol, interval, rows }) {
 
 async function main() {
   const args = parseArgs(process.argv);
-  const symbol = args.symbol ?? process.env.SYMBOL;
+  const symbol = args.symbol ?? process.env.BACKTEST_SYMBOL;
   if (!symbol) throw new Error('Missing --symbol');
 
   const startTime = parseTimeMs(args.start ?? args.startTime ?? (Date.now() - 30 * 24 * 60 * 60 * 1000));
@@ -201,11 +198,10 @@ async function main() {
     .map(s => s.trim())
     .filter(Boolean);
 
-  // Load extra buffer so we can build full buckets at the edges
   const warmupMs = intervalToMs('1d');
   const baseRows = await load5m({ symbol, startTime: startTime - warmupMs, endTime });
   if (!baseRows.length) {
-    logger.warn({ symbol }, 'No 5m candles found in range');
+    console.warn('No 5m candles found');
     return;
   }
 
@@ -213,27 +209,18 @@ async function main() {
 
   for (const itv of intervals) {
     const agg = aggregateBuckets({ symbol, baseRows, targetInterval: itv });
-
-    // Restrict to requested range only
     const filtered = agg.filter(r => r.open_time >= startTime && r.open_time <= endTime);
 
     await addIndicators({ symbol, interval: itv, rows: filtered });
 
     const { insertedOrUpdated } = await upsertCandles(filtered);
     summary.push({ interval: itv, candles: filtered.length, insertedOrUpdated });
-
-    logger.info({ symbol, interval: itv, candles: filtered.length, insertedOrUpdated }, 'Aggregated candles upserted');
   }
 
   console.log(JSON.stringify({ ok: true, symbol, startTime, endTime, summary }, null, 2));
-
-  if (process.env.CLOSE_DB_POOL === '1') {
-    await pool.end();
-  }
 }
 
-main().catch(async (err) => {
+main().catch((err) => {
   console.error(err);
-  try { await pool.end(); } catch {}
   process.exit(1);
 });

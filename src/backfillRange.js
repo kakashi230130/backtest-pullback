@@ -1,7 +1,5 @@
 import 'dotenv/config';
 
-import { config } from './config.js';
-import { logger } from './logger.js';
 import { fetchKlines, onlyClosedKlines } from './binanceClient.js';
 import { getRecentClosesBefore, mapKline, upsertCandles } from './candlesRepo.js';
 import { intervalToMs } from './intervals.js';
@@ -55,9 +53,7 @@ async function backfillSymbolIntervalRange({ symbol, interval, startTime, endTim
   const stepMs = intervalToMs(interval);
   let start = Number(startTime);
   const end = Number(endTime);
-  if (!Number.isFinite(start) || !Number.isFinite(end)) throw new Error('startTime/endTime invalid');
 
-  // Align start to the interval boundary to avoid partial buckets.
   start = Math.floor(start / stepMs) * stepMs;
 
   let pages = 0;
@@ -66,7 +62,6 @@ async function backfillSymbolIntervalRange({ symbol, interval, startTime, endTim
   while (pages < maxPages && start <= end) {
     pages += 1;
 
-    // Binance limit = 1000; request within [start, end]
     const klinesRaw = await fetchKlines({ symbol, interval, startTime: start, endTime: end, limit: 1000 });
     const klines = onlyClosedKlines(klinesRaw);
     if (!klines.length) break;
@@ -74,7 +69,6 @@ async function backfillSymbolIntervalRange({ symbol, interval, startTime, endTim
     let rows = klines.map(k => mapKline(symbol, interval, k));
     rows.sort((a, b) => a.open_time - b.open_time);
 
-    // Warmup closes from DB (best effort) to compute indicators for this page.
     const warmup = await getRecentClosesBefore(symbol, interval, rows[0].open_time, 260);
 
     const combined = [
@@ -99,13 +93,12 @@ async function backfillSymbolIntervalRange({ symbol, interval, startTime, endTim
     const last = rows[rows.length - 1];
     const nextStart = Number(last.open_time) + stepMs;
 
-    logger.info({ symbol, interval, pages, got: rows.length, total, nextStart }, 'Backfill range page done');
+    console.log(JSON.stringify({ symbol, interval, pages, got: rows.length, total, nextStart }, null, 2));
 
     if (!(nextStart > start)) break;
     start = nextStart;
 
-    if (rows.length < 1000) break; // likely caught up within endTime
-
+    if (rows.length < 1000) break;
     if (sleepMs > 0) await sleep(sleepMs);
   }
 
@@ -115,17 +108,13 @@ async function backfillSymbolIntervalRange({ symbol, interval, startTime, endTim
 async function main() {
   const args = parseArgs(process.argv);
 
-  const symbolArg = args.symbol ?? null;
-  const symbols = symbolArg
-    ? [symbolArg]
-    : (Array.isArray(config.symbols) && config.symbols.length ? config.symbols : []);
-
+  const symbol = args.symbol ?? process.env.BACKFILL_SYMBOL ?? process.env.BACKTEST_SYMBOL;
   const intervals = parseIntervals(args.interval ?? args.intervals) ?? ['5m'];
 
   const startTime = parseTimeMs(args.start ?? args.startTime);
   const endTime = parseTimeMs(args.end ?? args.endTime);
 
-  if (!symbols.length) throw new Error('Missing --symbol (or config.symbols is empty)');
+  if (!symbol) throw new Error('Missing --symbol');
   if (!startTime) throw new Error('Missing --start (ms or ISO)');
   if (!endTime) throw new Error('Missing --end (ms or ISO)');
 
@@ -133,10 +122,8 @@ async function main() {
   const sleepMs = Number(args.sleepMs ?? 250);
 
   const results = [];
-  for (const symbol of symbols) {
-    for (const interval of intervals) {
-      results.push(await backfillSymbolIntervalRange({ symbol, interval, startTime, endTime, maxPages, sleepMs }));
-    }
+  for (const interval of intervals) {
+    results.push(await backfillSymbolIntervalRange({ symbol, interval, startTime, endTime, maxPages, sleepMs }));
   }
 
   console.log(JSON.stringify({ ok: true, startTime, endTime, results }, null, 2));

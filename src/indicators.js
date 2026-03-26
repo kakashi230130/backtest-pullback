@@ -30,7 +30,6 @@ export function rsi(values, period = 14) {
   let avgGain = gainSum / period;
   let avgLoss = lossSum / period;
 
-  // First RSI value at index = period
   out[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
 
   for (let i = period + 1; i < values.length; i++) {
@@ -63,7 +62,6 @@ export function atr(highs, lows, closes, period = 14) {
     }
   }
 
-  // Wilder smoothing
   let sum = 0;
   for (let i = 0; i < period; i++) sum += tr[i];
   let prev = sum / period;
@@ -77,7 +75,7 @@ export function atr(highs, lows, closes, period = 14) {
   return out;
 }
 
-// ADX (Wilder), returns array of ADX values (null until enough warmup)
+// ADX (Wilder)
 export function adx(highs, lows, closes, period = 14) {
   const n = highs.length;
   const out = Array(n).fill(null);
@@ -100,7 +98,6 @@ export function adx(highs, lows, closes, period = 14) {
     tr[i] = Math.max(hl, hc, lc);
   }
 
-  // Wilder smoothing for TR and DMs
   let tr14 = 0;
   let p14 = 0;
   let m14 = 0;
@@ -123,7 +120,6 @@ export function adx(highs, lows, closes, period = 14) {
     dx[i] = denom === 0 ? 0 : (100 * Math.abs(plusDI - minusDI)) / denom;
   }
 
-  // First ADX = SMA of DX over period (starting at index period+1)
   let start = period + 1;
   let sumDX = 0;
   let count = 0;
@@ -146,7 +142,6 @@ export function adx(highs, lows, closes, period = 14) {
 }
 
 export function addIndicatorsToCandleRows(rows) {
-  // rows must be sorted by open_time ascending
   const closes = rows.map(r => Number(r.close));
 
   const ma20 = sma(closes, 20);
