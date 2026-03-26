@@ -309,6 +309,158 @@ function volumeSpikeOk(candles, { lookback = 20, mult = 1.5 } = {}) {
   return { ok, curVol, avg, mult: useMult, lookback: n };
 }
 
+function checkCandleConfirm15m(candles15m, direction) {
+  const slice = candles15m.slice(-4);
+  if (slice.length < 2) return { ok: false, reason: 'NOT_ENOUGH_CANDLES' };
+
+  const c0 = slice.at(-1);
+  const c1 = slice.at(-2);
+  const c2 = slice.at(-3);
+
+  if (direction === 'BUY') {
+    if (isBullishEngulfing(c1, c0)) return { ok: true, pattern: 'BULL_ENGULF', tf: '15m', candle: 'last' };
+    if (c2 && isBullishEngulfing(c2, c1)) return { ok: true, pattern: 'BULL_ENGULF', tf: '15m', candle: 'prev' };
+    if (isHammerLike(c0)) return { ok: true, pattern: 'HAMMER', tf: '15m', candle: 'last' };
+    if (isHammerLike(c1)) return { ok: true, pattern: 'HAMMER', tf: '15m', candle: 'prev' };
+    return { ok: false, reason: 'NO_BULL_CONFIRM' };
+  }
+
+  if (direction === 'SELL') {
+    if (isBearishEngulfing(c1, c0)) return { ok: true, pattern: 'BEAR_ENGULF', tf: '15m', candle: 'last' };
+    if (c2 && isBearishEngulfing(c2, c1)) return { ok: true, pattern: 'BEAR_ENGULF', tf: '15m', candle: 'prev' };
+    if (isShootingStarLike(c0)) return { ok: true, pattern: 'SHOOTING_STAR', tf: '15m', candle: 'last' };
+    if (isShootingStarLike(c1)) return { ok: true, pattern: 'SHOOTING_STAR', tf: '15m', candle: 'prev' };
+    return { ok: false, reason: 'NO_BEAR_CONFIRM' };
+  }
+
+  return { ok: false, reason: 'UNKNOWN_DIRECTION' };
+}
+
+function volumeOk15m(candles, mult = 1.3, lookback = 20) {
+  if (!candles || candles.length < lookback + 2) return { ok: false, reason: 'NOT_ENOUGH_BARS' };
+  const cur = candles[candles.length - 1];
+  const prev = candles.slice(Math.max(0, candles.length - 1 - lookback), candles.length - 1);
+  const curVol = Number(cur?.volume);
+  if (!Number.isFinite(curVol)) return { ok: false, reason: 'INVALID_VOL' };
+  const vols = prev.map(x => Number(x.volume)).filter(Number.isFinite);
+  if (vols.length < 5) return { ok: false, reason: 'NOT_ENOUGH_PREV' };
+  const avg = vols.reduce((a, b) => a + b, 0) / vols.length;
+  if (!(avg > 0)) return { ok: false, reason: 'ZERO_AVG' };
+  return { ok: curVol >= avg * mult, curVol, avg, mult };
+}
+
+function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, candles1d }) {
+  if (bias !== 'BUY' && bias !== 'SELL') return { ok: false, reason: 'BIAS_WAIT' };
+
+  const maZonePct = Number(process.env.PULLBACK_MA_ZONE_PCT ?? 0.004);
+  const rsi1hBullMin = Number(process.env.PULLBACK_RSI1H_BULL_MIN ?? 35);
+  const rsi1hBullMax = Number(process.env.PULLBACK_RSI1H_BULL_MAX ?? 55);
+  const rsi1hBearMin = Number(process.env.PULLBACK_RSI1H_BEAR_MIN ?? 45);
+  const rsi1hBearMax = Number(process.env.PULLBACK_RSI1H_BEAR_MAX ?? 65);
+  const volMult = Number(process.env.PULLBACK_VOLUME_MULT ?? 1.3);
+  const minRr = Number(process.env.PULLBACK_MIN_RR ?? 1.8);
+  const requireConfirm = (process.env.PULLBACK_REQUIRE_CONFIRM ?? '1') === '1';
+  const useMA200 = (process.env.PULLBACK_USE_MA200 ?? '1') === '1';
+
+  const last1h = last(candles1h);
+  const last15 = last(candles15);
+  if (!last1h || !last15) return { ok: false, reason: 'MISSING_TF' };
+
+  // Step 2: pullback near MA20/MA50/(MA200) on 1H
+  const close1h = last1h.close;
+  const ma20_1h = last1h.ma20;
+  const ma50_1h = last1h.ma50;
+  const ma200_1h = last1h.ma200;
+
+  const dMA20 = ma20_1h != null ? pctDist(close1h, ma20_1h) : null;
+  const dMA50 = ma50_1h != null ? pctDist(close1h, ma50_1h) : null;
+  const dMA200 = ma200_1h != null ? pctDist(close1h, ma200_1h) : null;
+
+  const nearMA20 = dMA20 != null && dMA20 <= maZonePct;
+  const nearMA50 = dMA50 != null && dMA50 <= maZonePct;
+  const nearMA200 = useMA200 && dMA200 != null && dMA200 <= maZonePct;
+
+  if (!(nearMA20 || nearMA50 || nearMA200)) {
+    return { ok: false, reason: 'NOT_AT_MA_ZONE', details: { dMA20, dMA50, dMA200, maZonePct } };
+  }
+
+  const whichMA = nearMA200 ? 'MA200' : (nearMA50 ? 'MA50' : 'MA20');
+
+  // Step 2b: anti-reversal guard around MA50
+  if (bias === 'BUY' && ma50_1h != null && close1h < ma50_1h * 0.995) {
+    return { ok: false, reason: 'BULL_PRICE_BELOW_MA50' };
+  }
+  if (bias === 'SELL' && ma50_1h != null && close1h > ma50_1h * 1.005) {
+    return { ok: false, reason: 'BEAR_PRICE_ABOVE_MA50' };
+  }
+
+  // Step 3: RSI 1H zone (recomputed from closes)
+  const closes1h = candles1h.map(c => c.close);
+  const rsiArr1h = calcRsi(closes1h, 14);
+  const rsi1h = rsiArr1h[rsiArr1h.length - 1];
+  if (rsi1h == null) return { ok: false, reason: 'NO_RSI_1H' };
+
+  let rsiOk = false;
+  if (bias === 'BUY' && rsi1h >= rsi1hBullMin && rsi1h <= rsi1hBullMax) rsiOk = true;
+  if (bias === 'SELL' && rsi1h >= rsi1hBearMin && rsi1h <= rsi1hBearMax) rsiOk = true;
+  if (!rsiOk) {
+    return { ok: false, reason: 'RSI_OUT_OF_ZONE', details: { rsi1h, bias, rsi1hBullMin, rsi1hBullMax, rsi1hBearMin, rsi1hBearMax } };
+  }
+
+  // Step 4: confirmation candle on 15m
+  let confirmResult = { ok: true, pattern: 'SKIPPED' };
+  if (requireConfirm) {
+    confirmResult = checkCandleConfirm15m(candles15, bias);
+    if (!confirmResult.ok) return { ok: false, reason: confirmResult.reason, details: { confirmResult, bias } };
+  }
+
+  // Step 5: volume spike on 15m
+  const volResult = volumeOk15m(candles15, volMult, 20);
+  if (!volResult.ok) return { ok: false, reason: 'VOLUME_FILTER', details: volResult };
+
+  // RR filter is enforced in SLTP builder; keep minRr for reporting
+  return { ok: true, mode: 'PULLBACK_TO_MA', details: { whichMA, rsi1h, confirmResult, volResult, minRr } };
+}
+
+function buildSltpPullbackToMa({ bias, entry, candles1h }) {
+  const slAtrMult = Number(process.env.PULLBACK_SL_ATR_MULT ?? 0.5);
+  const tpRMult = Number(process.env.PULLBACK_TP_R_MULT ?? 2.0);
+  const minRr = Number(process.env.PULLBACK_MIN_RR ?? 1.8);
+
+  const last1h = last(candles1h);
+  if (!last1h) return { ok: false, reason: 'NO_1H' };
+
+  const highs1h = candles1h.map(c => c.high);
+  const lows1h = candles1h.map(c => c.low);
+  const closes1h = candles1h.map(c => c.close);
+  const atrArr1h = calcAtr(highs1h, lows1h, closes1h, 14);
+  const atr1h = atrArr1h[atrArr1h.length - 1];
+  const slBuffer = atr1h != null ? atr1h * Math.max(0, slAtrMult) : 0;
+
+  const ma50_1h = last1h.ma50;
+
+  let sl, tp, risk;
+
+  if (bias === 'BUY') {
+    const slBase = ma50_1h ?? (entry * 0.995);
+    sl = slBase - slBuffer;
+    risk = entry - sl;
+    if (!(risk > 0)) return { ok: false, reason: 'INVALID_RISK_BUY', entry, sl };
+    tp = entry + tpRMult * risk;
+  } else {
+    const slBase = ma50_1h ?? (entry * 1.005);
+    sl = slBase + slBuffer;
+    risk = sl - entry;
+    if (!(risk > 0)) return { ok: false, reason: 'INVALID_RISK_SELL', entry, sl };
+    tp = entry - tpRMult * risk;
+  }
+
+  const rr = Number(tpRMult);
+  if (rr < minRr) return { ok: false, reason: 'RR_TOO_LOW', rr, minRr };
+
+  return { ok: true, sl, tp, rr, meta: { strategy: 'PULLBACK_TO_MA', atr1h, slBuffer, slAtrMult, tpRMult, ma50_1h } };
+}
+
 export function isEntrySignalV2({ bias, candles30, candles15, candles5, candles1h = null }) {
   const profile = (process.env.ANALYZE_PROFILE ?? 'strict').toLowerCase();
   const strategy = String(process.env.ANALYZE_STRATEGY ?? 'DEFAULT').toUpperCase();
@@ -376,69 +528,66 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs }) {
     }
   }
 
-  const c30 = last(data['30m']);
+  const c15 = last(data['15m']);
   const c1h = last(data['1h']);
   const c4h = last(data['4h']);
   const c1d = last(data['1d']);
 
-  const trend1d = trendLabel(c1d ?? {});
-  const trend4h = trendLabel(c4h ?? {});
-  const trend1h = trendLabel(c1h ?? {});
+  // Pullback-to-MA strategy (ported from analyzePullback.js)
+  const strategy = String(process.env.ANALYZE_STRATEGY ?? 'PULLBACK_TO_MA').toUpperCase();
 
-  let bias = decideBias(trend1d, trend4h, trend1h);
-  if (bias === 'BUY') bias = 'WAIT';
-  let entryCheck = isEntrySignalV2({
-    bias,
-    candles30: data['30m'],
-    candles15: data['15m'],
-    candles5: data['5m'],
-    candles1h: data['1h'],
-  });
+  // Trend filter on HTF: use MA20/MA50 agreement on 4H + 1D
+  function trendOf(c) {
+    if (!c || c.ma20 == null || c.ma50 == null || c.close == null) return 'NEUTRAL';
+    if (c.close > c.ma50 && c.ma20 > c.ma50) return 'BULL';
+    if (c.close < c.ma50 && c.ma20 < c.ma50) return 'BEAR';
+    return 'NEUTRAL';
+  }
 
+  const trend4h = trendOf(c4h);
+  const trend1d = trendOf(c1d);
+  let htfTrend = 'NEUTRAL';
+  if (trend4h === 'BULL' && trend1d === 'BULL') htfTrend = 'BULL';
+  else if (trend4h === 'BEAR' && trend1d === 'BEAR') htfTrend = 'BEAR';
+
+  let bias = htfTrend === 'BULL' ? 'BUY' : (htfTrend === 'BEAR' ? 'SELL' : 'WAIT');
+
+  // Entry check
+  let entryCheck = { ok: false, reason: 'BIAS_WAIT' };
   let setup = null;
 
-  if (!setup && bias !== 'WAIT' && entryCheck.ok) {
-    const base = c5.close;
-    const offsetPctRaw = Number(process.env.ENTRY_OFFSET_PCT ?? 0.0005);
-    const offsetMaxRaw = Number(process.env.ENTRY_OFFSET_MAX_PCT ?? 0.002);
-    const offsetPct = Math.min(Math.max(offsetPctRaw, 0), Math.max(offsetMaxRaw, 0));
-    const entry = bias === 'BUY' ? base * (1 - offsetPct) : base * (1 + offsetPct);
+  if (strategy === 'PULLBACK_TO_MA') {
+    entryCheck = isEntrySignalPullbackToMa({ bias, candles15: data['15m'], candles1h: data['1h'], candles4h: data['4h'], candles1d: data['1d'] });
 
-    const strategy = String(process.env.ANALYZE_STRATEGY ?? 'DEFAULT').toUpperCase();
-
-    if (strategy === 'STACKED_TREND_STRATEGY') {
-      const highs15 = data['15m'].map(c => c.high);
-      const lows15 = data['15m'].map(c => c.low);
-      const closes15 = data['15m'].map(c => c.close);
-      const atr15 = calcAtr(highs15, lows15, closes15, 14);
-      const atrNow15 = atr15[atr15.length - 1];
-      const k = Number(process.env.STACKED_SL_ATR_MULT ?? 2.0);
-      const slDist = atrNow15 != null ? atrNow15 * Math.max(0, k) : null;
-      if (slDist != null && slDist > 0) {
-        const rr = Number(process.env.STACKED_TP_RR ?? 2.0);
-        const rrMult = Math.max(0.5, Math.min(rr, 5));
-        if (bias === 'BUY') {
-          const sl = entry - slDist;
-          const risk = entry - sl;
-          const tp = entry + rrMult * risk;
-          if (risk > 0) setup = { action: 'BUY', entry, sl, tp, rr: rrMult, reasons: { entryCheck, sltpMeta: { strategy, atrNow15, slDist, rrMult } } };
+    if (bias !== 'WAIT' && entryCheck.ok) {
+      const entry = c15?.close;
+      if (entry != null) {
+        const sltp = buildSltpPullbackToMa({ bias, entry, candles1h: data['1h'] });
+        if (sltp?.ok) {
+          setup = {
+            action: bias,
+            entry,
+            sl: sltp.sl,
+            tp: sltp.tp,
+            rr: sltp.rr,
+            reasons: { entryCheck, sltpMeta: sltp.meta },
+          };
         } else {
-          const sl = entry + slDist;
-          const risk = sl - entry;
-          const tp = entry - rrMult * risk;
-          if (risk > 0) setup = { action: 'SELL', entry, sl, tp, rr: rrMult, reasons: { entryCheck, sltpMeta: { strategy, atrNow15, slDist, rrMult } } };
+          entryCheck = { ok: false, reason: sltp?.reason ?? 'SLTP_FAIL', details: sltp ?? null };
         }
+      } else {
+        entryCheck = { ok: false, reason: 'MISSING_15M' };
       }
-    } else {
-      // minimal: no other SLTP
-      setup = null;
     }
+  } else {
+    // fallback: keep minimal behavior (no setups)
+    entryCheck = { ok: false, reason: 'UNKNOWN_STRATEGY', details: { strategy } };
   }
 
   return {
     symbol,
-    snapshots: { c5, c30, c1h, c4h, c1d },
-    trends: { trend1d, trend4h, trend1h },
+    snapshots: { c5, c15, c1h, c4h, c1d },
+    trends: { trend4h, trend1d, htfTrend },
     bias,
     entryCheck,
     setup,
