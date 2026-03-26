@@ -51,6 +51,13 @@ function pnlLinearUSDT({ side, entry, exit, qty }) {
   return (e - x) * q;
 }
 
+function stripInternalPoint(pt) {
+  if (!pt) return pt;
+  // remove internal markers from output
+  const { __pushed, __signal, ...rest } = pt;
+  return rest;
+}
+
 function computeMaxDrawdown(equityCurve) {
   let peak = -Infinity;
   let maxDD = 0;
@@ -64,7 +71,7 @@ function computeMaxDrawdown(equityCurve) {
   return maxDD;
 }
 
-export function buildBacktestSummary({ trades, equityCurve, initialBalance }) {
+export function buildBacktestSummary({ trades, initialBalance, finalEquity, maxDrawdown }) {
   const total = trades.length;
   const wins = trades.filter(t => t.netPnl > 0).length;
   const losses = trades.filter(t => t.netPnl < 0).length;
@@ -73,20 +80,17 @@ export function buildBacktestSummary({ trades, equityCurve, initialBalance }) {
   const grossProfit = trades.filter(t => t.netPnl > 0).reduce((a, t) => a + t.netPnl, 0);
   const grossLoss = trades.filter(t => t.netPnl < 0).reduce((a, t) => a + Math.abs(t.netPnl), 0);
   const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : null;
-  const maxDrawdown = computeMaxDrawdown(equityCurve);
-
-  const finalEquity = equityCurve.length ? equityCurve[equityCurve.length - 1].equity : initialBalance;
 
   return {
     initial_balance: initialBalance,
-    final_equity: finalEquity,
+    final_equity: finalEquity ?? initialBalance,
     net_profit: netProfit,
     total_trades: total,
     wins,
     losses,
     win_rate: winRate,
     profit_factor: profitFactor,
-    max_drawdown: maxDrawdown,
+    max_drawdown: maxDrawdown ?? 0,
   };
 }
 
@@ -124,8 +128,21 @@ export function runBacktest({
   let equity = Number(initialBalance);
   let balance = Number(initialBalance);
 
+  // NOTE: we keep equity_curve output filtered (to reduce JSON size),
+  // but still compute drawdown + final equity from the full run.
   const equityCurve = [];
   const trades = [];
+
+  const equityContextPre = Math.max(0, Math.min(Number(process.env.BACKTEST_EQUITY_CONTEXT_PRE ?? 1), 5));
+  const equityContextPost = Math.max(0, Math.min(Number(process.env.BACKTEST_EQUITY_CONTEXT_POST ?? 1), 5));
+  const tradeContextBars = Math.max(0, Math.min(Number(process.env.BACKTEST_TRADE_CONTEXT_BARS ?? 1), 10));
+
+  let peakEquity = equity;
+  let maxDrawdown = 0;
+  let finalEquity = equity;
+
+  let lastEquityPoint = null;
+  let postContextCountdown = 0;
 
   const debugStats = {
     bars_total: 0,
@@ -152,6 +169,10 @@ export function runBacktest({
 
   for (let i = i0; i < candles5.length; i++) {
     const c5 = candles5[i];
+
+    let didFillThisBar = false;
+    let didCloseThisBar = false;
+    let signalThisBar = false;
     if (c5.open_time > end) break;
     debugStats.bars_total += 1;
 
@@ -172,6 +193,7 @@ export function runBacktest({
     if (pending) {
       const filled = candleHitsPrice(c5, pending.entryPrice);
       if (filled) {
+        didFillThisBar = true;
         debugStats.pending_filled += 1;
         const entryFill = applySlippage({ side: pending.side, price: pending.entryPrice, slippagePct });
         const notional = entryFill * pending.qty;
@@ -183,6 +205,7 @@ export function runBacktest({
           ...pending,
           entryFill,
           entryTime: c5.open_time,
+          entryIndex5m: i,
           initialSl: pending.sl,
           currentSl: pending.sl,
           tp: pending.tp,
@@ -212,6 +235,12 @@ export function runBacktest({
         balance += (gross - feeOut);
         equity = balance;
 
+        const entryIdx = Number.isInteger(open.entryIndex5m) ? open.entryIndex5m : null;
+        const exitIdx = i;
+        const ctxN = tradeContextBars;
+        const ctxEntry = entryIdx == null ? null : candles5.slice(Math.max(0, entryIdx - ctxN), Math.min(candles5.length, entryIdx + ctxN + 1));
+        const ctxExit = candles5.slice(Math.max(0, exitIdx - ctxN), Math.min(candles5.length, exitIdx + ctxN + 1));
+
         trades.push({
           symbol,
           side: open.side,
@@ -230,8 +259,13 @@ export function runBacktest({
           leverage,
           margin_used: (open.entryFill * (open.qtyOriginal || open.qty)) / Math.max(1, Number(leverage) || 1),
           meta: open.meta ?? null,
+          context_candles: {
+            entry_5m: ctxEntry,
+            exit_5m: ctxExit,
+          },
         });
 
+        didCloseThisBar = true;
         open = null;
       } else {
         if (wantPTP) {
@@ -284,6 +318,12 @@ export function runBacktest({
 
                 balance += (gross2 - feeOut2);
 
+                const entryIdx = Number.isInteger(open.entryIndex5m) ? open.entryIndex5m : null;
+                const exitIdx = i;
+                const ctxN = tradeContextBars;
+                const ctxEntry = entryIdx == null ? null : candles5.slice(Math.max(0, entryIdx - ctxN), Math.min(candles5.length, entryIdx + ctxN + 1));
+                const ctxExit = candles5.slice(Math.max(0, exitIdx - ctxN), Math.min(candles5.length, exitIdx + ctxN + 1));
+
                 trades.push({
                   symbol,
                   side: open.side,
@@ -302,8 +342,13 @@ export function runBacktest({
                   leverage,
                   margin_used: (open.entryFill * open.qtyOriginal) / Math.max(1, Number(leverage) || 1),
                   meta: { ...open.meta, ptp: open.ptp },
+                  context_candles: {
+                    entry_5m: ctxEntry,
+                    exit_5m: ctxExit,
+                  },
                 });
 
+                didCloseThisBar = true;
                 open = null;
               }
             }
@@ -324,6 +369,12 @@ export function runBacktest({
               balance += (gross - feeOut);
               equity = balance;
 
+              const entryIdx = Number.isInteger(open.entryIndex5m) ? open.entryIndex5m : null;
+              const exitIdx = i;
+              const ctxN = tradeContextBars;
+              const ctxEntry = entryIdx == null ? null : candles5.slice(Math.max(0, entryIdx - ctxN), Math.min(candles5.length, entryIdx + ctxN + 1));
+              const ctxExit = candles5.slice(Math.max(0, exitIdx - ctxN), Math.min(candles5.length, exitIdx + ctxN + 1));
+
               trades.push({
                 symbol,
                 side: open.side,
@@ -342,8 +393,13 @@ export function runBacktest({
                 leverage,
                 margin_used: (open.entryFill * open.qtyOriginal) / Math.max(1, Number(leverage) || 1),
                 meta: { ...open.meta, ptp: open.ptp },
+                context_candles: {
+                  entry_5m: ctxEntry,
+                  exit_5m: ctxExit,
+                },
               });
 
+              didCloseThisBar = true;
               open = null;
             }
           }
@@ -371,6 +427,12 @@ export function runBacktest({
             balance += (gross - feeOut);
             equity = balance;
 
+            const entryIdx = Number.isInteger(open.entryIndex5m) ? open.entryIndex5m : null;
+            const exitIdx = i;
+            const ctxN = tradeContextBars;
+            const ctxEntry = entryIdx == null ? null : candles5.slice(Math.max(0, entryIdx - ctxN), Math.min(candles5.length, entryIdx + ctxN + 1));
+            const ctxExit = candles5.slice(Math.max(0, exitIdx - ctxN), Math.min(candles5.length, exitIdx + ctxN + 1));
+
             trades.push({
               symbol,
               side: open.side,
@@ -389,8 +451,13 @@ export function runBacktest({
               leverage,
               margin_used: (open.entryFill * open.qty) / Math.max(1, Number(leverage) || 1),
               meta: open.meta ?? null,
+              context_candles: {
+                entry_5m: ctxEntry,
+                exit_5m: ctxExit,
+              },
             });
 
+            didCloseThisBar = true;
             open = null;
           }
         }
@@ -418,6 +485,7 @@ export function runBacktest({
 
       const setup = analysis?.setup;
       if (setup && (setup.action === 'BUY' || setup.action === 'SELL')) {
+        signalThisBar = true;
         const side = sideFromAction(setup.action);
         const entry = Number(setup.entry);
         const sl = Number(setup.sl);
@@ -452,7 +520,15 @@ export function runBacktest({
     const equityMtM = balance + (open ? pnlLinearUSDT({ side: open.side, entry: open.entryFill, exit: c5.close, qty: open.qty }) : 0);
     equity = equityMtM;
 
-    equityCurve.push({
+    // Update drawdown stats from the FULL run (not filtered)
+    finalEquity = equityMtM;
+    if (equityMtM > peakEquity) peakEquity = equityMtM;
+    const dd = peakEquity > 0 ? (peakEquity - equityMtM) / peakEquity : 0;
+    if (dd > maxDrawdown) maxDrawdown = dd;
+
+    // Filter equity curve output: only keep bars with trading activity / signals,
+    // plus optional context bars around those events.
+    const point = {
       time: nowMs,
       equity: equityMtM,
       balance,
@@ -460,11 +536,39 @@ export function runBacktest({
       open_position: open ? { side: open.side, entry: open.entryFill, sl: open.currentSl, tp: open.tp, qty: open.qty } : null,
       pending_entry: pending ? { side: pending.side, entry: pending.entryPrice, qty: pending.qty } : null,
       close: c5.close,
-    });
+    };
+
+    // Decide if this bar is "interesting"
+    // - open position exists
+    // - pending exists
+    // - fill/close happened on this candle
+    // - analysis produced a valid setup (signal)
+    // - within post-context window
+    let interesting = Boolean(open || pending || didFillThisBar || didCloseThisBar || signalThisBar);
+
+    if (!interesting && postContextCountdown > 0) interesting = true;
+
+    if (interesting) {
+      // include N bars before the first interesting point
+      if (equityContextPre > 0 && lastEquityPoint && lastEquityPoint.__pushed !== true) {
+        equityCurve.push(stripInternalPoint(lastEquityPoint));
+        lastEquityPoint.__pushed = true;
+      }
+
+      equityCurve.push(stripInternalPoint(point));
+      postContextCountdown = Math.max(postContextCountdown, equityContextPost);
+      if (postContextCountdown > 0) postContextCountdown -= 1;
+      point.__pushed = true;
+    } else {
+      // not interesting: keep last point as potential pre-context
+      postContextCountdown = 0;
+    }
+
+    lastEquityPoint = { ...point, __pushed: point.__pushed ?? false, __signal: signalThisBar };
   }
 
   if (pending) debugStats.pending_never_filled += 1;
 
-  const summary = buildBacktestSummary({ trades, equityCurve, initialBalance });
+  const summary = buildBacktestSummary({ trades, initialBalance, finalEquity, maxDrawdown });
   return { summary, trades, equity_curve: equityCurve, debug: debug ? debugStats : undefined };
 }
