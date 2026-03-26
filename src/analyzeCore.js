@@ -423,42 +423,67 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
 }
 
 function buildSltpPullbackToMa({ bias, entry, candles1h }) {
-  const slAtrMult = Number(process.env.PULLBACK_SL_ATR_MULT ?? 0.5);
-  const tpRMult = Number(process.env.PULLBACK_TP_R_MULT ?? 2.0);
+  // New SL/TP logic (per requirement):
+  // - Use swing low/high of last 5 candles on 1H
+  // - SL = swing +/- 0.2*ATR(1H)
+  // - If SL invalid vs entry, force SL = entry +/- 1.5*ATR(1H)
+  // - TP maintains RR=1:2 => TP = entry +/- dist*2
   const minRr = Number(process.env.PULLBACK_MIN_RR ?? 1.8);
 
-  const last1h = last(candles1h);
-  if (!last1h) return { ok: false, reason: 'NO_1H' };
+  if (!candles1h || candles1h.length < 20) return { ok: false, reason: 'NOT_ENOUGH_1H' };
 
   const highs1h = candles1h.map(c => c.high);
   const lows1h = candles1h.map(c => c.low);
   const closes1h = candles1h.map(c => c.close);
   const atrArr1h = calcAtr(highs1h, lows1h, closes1h, 14);
   const atr1h = atrArr1h[atrArr1h.length - 1];
-  const slBuffer = atr1h != null ? atr1h * Math.max(0, slAtrMult) : 0;
+  if (atr1h == null || !(atr1h > 0)) return { ok: false, reason: 'NO_ATR_1H' };
 
-  const ma50_1h = last1h.ma50;
+  const nSwing = 5;
+  const swingSlice = candles1h.slice(-nSwing);
+  if (swingSlice.length < nSwing) return { ok: false, reason: 'NOT_ENOUGH_SWING_BARS' };
 
-  let sl, tp, risk;
+  const swingLow = Math.min(...swingSlice.map(c => Number(c.low)).filter(Number.isFinite));
+  const swingHigh = Math.max(...swingSlice.map(c => Number(c.high)).filter(Number.isFinite));
+  if (!Number.isFinite(swingLow) || !Number.isFinite(swingHigh)) return { ok: false, reason: 'SWING_INVALID' };
+
+  const trail = 0.2 * atr1h;
+  const force = 1.5 * atr1h;
+
+  let sl, tp, dist;
 
   if (bias === 'BUY') {
-    const slBase = ma50_1h ?? (entry * 0.995);
-    sl = slBase - slBuffer;
-    risk = entry - sl;
-    if (!(risk > 0)) return { ok: false, reason: 'INVALID_RISK_BUY', entry, sl };
-    tp = entry + tpRMult * risk;
+    sl = swingLow - trail;
+    if (!(sl < entry)) sl = entry - force;
+    dist = entry - sl;
+    if (!(dist > 0)) return { ok: false, reason: 'INVALID_RISK_BUY', entry, sl };
+    tp = entry + dist * 2;
   } else {
-    const slBase = ma50_1h ?? (entry * 1.005);
-    sl = slBase + slBuffer;
-    risk = sl - entry;
-    if (!(risk > 0)) return { ok: false, reason: 'INVALID_RISK_SELL', entry, sl };
-    tp = entry - tpRMult * risk;
+    sl = swingHigh + trail;
+    if (!(sl > entry)) sl = entry + force;
+    dist = sl - entry;
+    if (!(dist > 0)) return { ok: false, reason: 'INVALID_RISK_SELL', entry, sl };
+    tp = entry - dist * 2;
   }
 
-  const rr = Number(tpRMult);
+  const rr = 2;
   if (rr < minRr) return { ok: false, reason: 'RR_TOO_LOW', rr, minRr };
 
-  return { ok: true, sl, tp, rr, meta: { strategy: 'PULLBACK_TO_MA', atr1h, slBuffer, slAtrMult, tpRMult, ma50_1h } };
+  return {
+    ok: true,
+    sl,
+    tp,
+    rr,
+    meta: {
+      strategy: 'PULLBACK_TO_MA',
+      atr1h,
+      swingLow,
+      swingHigh,
+      swingBars: nSwing,
+      slTrailAtr: 0.2,
+      slForceAtr: 1.5,
+    },
+  };
 }
 
 export function isEntrySignalV2({ bias, candles30, candles15, candles5, candles1h = null }) {
