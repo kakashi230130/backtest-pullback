@@ -94,11 +94,6 @@ async function main() {
 
   const debug = String(args.debug ?? process.env.BACKTEST_DEBUG ?? '0') === '1';
 
-  const symbolConfigs = {
-    BTCUSDT: { atrMultiplier: 1.5 },
-    ETHUSDT: { atrMultiplier: 2.5 },
-  };
-
   const result = runBacktest({
     symbol,
     startTime,
@@ -110,7 +105,7 @@ async function main() {
     slippagePct,
     data,
     indicatorsFromDb,
-    symbolConfigs,
+    // Symbol configs now live in analyzeCore.js (DEFAULT_CONFIG/SYMBOL_CONFIGS)
     btcCandles1h,
     btcIndicatorsFromDb,
     debug,

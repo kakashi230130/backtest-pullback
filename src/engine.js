@@ -492,7 +492,7 @@ export function runBacktest({
     // Analyze + open new pending
     if (!open && !pending) {
       const requireBtcContext = String(symbol).toUpperCase() !== 'BTCUSDT';
-      const analysis = analyzeSymbolFromCandles({ symbol, data: snapData, nowMs, btcContext, requireBtcContext, symbolConfigs });
+      const analysis = analyzeSymbolFromCandles(symbol, snapData['5m'] ?? [], snapData['15m'] ?? [], snapData['1h'] ?? [], snapData, btcContext, requireBtcContext, nowMs, symbolConfigs);
       if (!analysis) {
         debugStats.analysis_null += 1;
       } else {

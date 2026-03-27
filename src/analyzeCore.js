@@ -452,7 +452,7 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
 
   if (adx1h == null) return { ok: false, reason: 'NO_ADX_1H', debug: { adx1h: null, ...(btcDebug ?? {}) } };
   if (adx1h < adxMin) {
-    return { ok: false, reason: 'adx_weak_trend', debug: { adx1h, adxMin, ...(btcDebug ?? {}) } };
+    return { ok: false, reason: 'WEAK_TREND_ADX', debug: { adx1h, adxMin, ...(btcDebug ?? {}) } };
   }
 
   // Step 4: RSI 1H zone (recomputed from closes)
@@ -510,7 +510,7 @@ function buildSltpPullbackToMa({ bias, entry, candles1h, atrMultiplier = null })
   const atr1h = atrArr1h[atrArr1h.length - 1];
   if (atr1h == null || !(atr1h > 0)) return { ok: false, reason: 'NO_ATR_1H' };
 
-  const nSwing = 5;
+  const nSwing = Math.max(3, Math.min(Number(swingLookback) || 5, 20));
   const swingSlice = candles1h.slice(-nSwing);
   if (swingSlice.length < nSwing) return { ok: false, reason: 'NOT_ENOUGH_SWING_BARS' };
 
@@ -556,8 +556,8 @@ function buildSltpPullbackToMa({ bias, entry, candles1h, atrMultiplier = null })
       swingLow,
       swingHigh,
       swingBars: nSwing,
-      slTrailAtr: 0.2,
-      slForceAtr: useMult,
+      slTrailAtr: useMult,
+      slForceAtr: 1.5,
     },
   };
 }
@@ -618,7 +618,25 @@ function recentSwingHigh(candles, lookback = 20) {
   return Math.max(...slice.map(c => c.high));
 }
 
-export function analyzeSymbolFromCandles({ symbol, data, nowMs, btcContext = null, requireBtcContext = false, symbolConfigs = null }) {
+// analyzeSymbolFromCandles supports both:
+// - legacy object signature: ({ symbol, data, nowMs, btcContext, requireBtcContext, symbolConfigs })
+// - requirement10 positional signature:
+//   (symbol, candles5, candles15, candles1h, snapData, btcContext, requireBtcContext, nowMs, symbolConfigs)
+export function analyzeSymbolFromCandles(...args) {
+  let symbol;
+  let data;
+  let nowMs;
+  let btcContext = null;
+  let requireBtcContext = false;
+  let symbolConfigs = null;
+
+  if (args.length === 1 && args[0] && typeof args[0] === 'object' && 'data' in args[0]) {
+    ({ symbol, data, nowMs, btcContext = null, requireBtcContext = false, symbolConfigs = null } = args[0]);
+  } else {
+    // positional
+    [symbol, , , , data, btcContext = null, requireBtcContext = false, nowMs, symbolConfigs = null] = args;
+  }
+
   const c5 = last(data['5m']);
 
   const maxStalenessMs = Number(process.env.MAX_CANDLE_STALENESS_MS ?? 15 * 60 * 1000);
@@ -653,13 +671,13 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs, btcContext = nul
 
   let bias = htfTrend === 'BULL' ? 'BUY' : (htfTrend === 'BEAR' ? 'SELL' : 'WAIT');
 
-  // ADX regime filter (Requirement): only allow BUY/SELL bias when ADX(14) on 1H > 25.
-  // This helps avoid sideways/choppy regimes.
-  const adxMinBias = Number(process.env.ADX_MIN_BIAS_LEVEL ?? 25);
+  // ADX regime filter (Requirement10): only allow BUY/SELL bias when ADX(14) on 1H >= config.adxThreshold.
+  const cfg = getSymbolConfig(symbol, symbolConfigs);
+  const adxMinBias = Number(cfg?.adxThreshold ?? DEFAULT_CONFIG.adxThreshold);
+
   const arr1h = data['1h'] ?? [];
   if (bias !== 'WAIT') {
     if (arr1h.length < 40) {
-      // Not enough bars to compute a reliable ADX → be conservative.
       bias = 'WAIT';
     } else {
       const highs1h = arr1h.map(c => c.high);
@@ -667,7 +685,7 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs, btcContext = nul
       const closes1h = arr1h.map(c => c.close);
       const adx1hArr = calcAdx(highs1h, lows1h, closes1h, 14);
       const adx1hNow = adx1hArr[adx1hArr.length - 1];
-      if (!(adx1hNow > adxMinBias)) {
+      if (!(adx1hNow != null && adx1hNow >= adxMinBias)) {
         bias = 'WAIT';
       }
     }
@@ -695,17 +713,19 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs, btcContext = nul
         candles1d: data['1d'],
         btcContext,
         requireBtcContext,
+        symbol,
+        symbolConfigs,
       });
     }
 
     if (bias !== 'WAIT' && entryCheck.ok) {
       const entry = c15?.close;
       if (entry != null) {
-        const symKey = String(symbol ?? '').toUpperCase();
-        const cfg = symbolConfigs && typeof symbolConfigs === 'object' ? symbolConfigs[symKey] : null;
-        const atrMultiplier = cfg?.atrMultiplier ?? null;
+        const cfg = getSymbolConfig(symbol, symbolConfigs);
+        const atrMultiplier = cfg?.atrMultiplier ?? DEFAULT_CONFIG.atrMultiplier;
+        const swingLookback = cfg?.swingLookback ?? DEFAULT_CONFIG.swingLookback;
 
-        const sltp = buildSltpPullbackToMa({ bias, entry, candles1h: data['1h'], atrMultiplier });
+        const sltp = buildSltpPullbackToMa({ bias, entry, candles1h: data['1h'], atrMultiplier, swingLookback });
         if (sltp?.ok) {
           setup = {
             action: bias,
