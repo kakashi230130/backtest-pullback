@@ -204,11 +204,13 @@ export function runBacktest({
     // BTC context matching (Requirement):
     // Symbol main loop runs on 5m/15m, but BTC context is fixed at 1h.
     // We match BTC candle by hour bucket of the *current* 15m candle.
-    const c15Now = snapData['15m']?.at(-1) ?? null;
-    const btcHourTimestamp = c15Now?.open_time != null
-      ? Math.floor(Number(c15Now.open_time) / 3600000) * 3600000
-      : null;
-    const btcContext = (btcMap && btcHourTimestamp != null) ? (btcMap.get(btcHourTimestamp) ?? null) : null;
+    // const c15Now = snapData['15m']?.at(-1) ?? null;
+    // const btcHourTimestamp = c15Now?.open_time != null
+    //   ? Math.floor(Number(c15Now.open_time) / 3600000) * 3600000
+    //   : null;
+    // const btcContext = (btcMap && btcHourTimestamp != null) ? (btcMap.get(btcHourTimestamp) ?? null) : null;
+    const lastClosedHourStart = Math.floor(nowMs / 3600000) * 3600000 - 3600000;
+    const btcContext = btcMap ? (btcMap.get(lastClosedHourStart) ?? null) : null;
 
     // Fill pending limit (option B)
     if (pending) {

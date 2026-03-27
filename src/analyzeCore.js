@@ -416,6 +416,12 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
     const btcMa50 = Number(btcContext.ma50);
     const btcRsi = Number(btcContext.rsi);
 
+    const btcIsBull = btcClose > btcMa50 && btcRsi > 50;
+    const btcIsBear = btcClose < btcMa50 && btcRsi < 50;
+
+    if (bias === 'BUY' && !btcIsBull) return { ok: false, reason: 'btc_not_bullish' };
+    if (bias === 'SELL' && !btcIsBear) return { ok: false, reason: 'btc_not_bearish' };
+
     const debugBtc = { btc_close: btcClose, btc_ma50: btcMa50, btc_rsi: btcRsi };
 
     if (![btcClose, btcMa50, btcRsi].every(Number.isFinite)) {
