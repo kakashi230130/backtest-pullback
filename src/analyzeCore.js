@@ -402,11 +402,24 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
     return { ok: false, reason: 'BEAR_PRICE_ABOVE_MA50' };
   }
 
-  // Step 3: RSI 1H zone (recomputed from closes)
+  // Step 3: ADX 1H filter (Requirement)
+  // Only trade when trend strength is clear: ADX(14) on 1H must be >= threshold.
+  const adxMin = Number(process.env.ADX_MIN_LEVEL ?? 25);
+  const highs1h = candles1h.map(c => c.high);
+  const lows1h = candles1h.map(c => c.low);
   const closes1h = candles1h.map(c => c.close);
+  const adxArr1h = calcAdx(highs1h, lows1h, closes1h, 14);
+  const adx1h = adxArr1h[adxArr1h.length - 1];
+
+  if (adx1h == null) return { ok: false, reason: 'NO_ADX_1H', debug: { adx1h: null } };
+  if (adx1h < adxMin) {
+    return { ok: false, reason: 'adx_weak_trend', debug: { adx1h, adxMin } };
+  }
+
+  // Step 4: RSI 1H zone (recomputed from closes)
   const rsiArr1h = calcRsi(closes1h, 14);
   const rsi1h = rsiArr1h[rsiArr1h.length - 1];
-  if (rsi1h == null) return { ok: false, reason: 'NO_RSI_1H', debug: { rsi1h: null } };
+  if (rsi1h == null) return { ok: false, reason: 'NO_RSI_1H', debug: { rsi1h: null, adx1h } };
 
   let rsiOk = false;
   if (bias === 'BUY' && rsi1h >= rsiBuyLow && rsi1h <= rsiBuyHigh) rsiOk = true;
@@ -416,7 +429,7 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
       ok: false,
       reason: 'RSI_OUT_OF_ZONE',
       details: { rsi1h, bias, rsiBuyLow, rsiBuyHigh, rsiSellLow, rsiSellHigh },
-      debug: { rsi1h },
+      debug: { rsi1h, adx1h },
     };
   }
 
@@ -437,7 +450,7 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
     mode: 'PULLBACK_TO_MA',
     details: { whichMA, rsi1h, confirmResult, volResult, minRr },
     // Requirement: keep RSI in debug so it shows up in backtest result logs.
-    debug: { rsi1h },
+    debug: { rsi1h, adx1h },
   };
 }
 
