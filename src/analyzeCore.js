@@ -2,6 +2,27 @@ import { adx as calcAdx, rsi as calcRsi, sma as calcSma, atr as calcAtr } from '
 
 export const INTERVALS = ['5m', '15m', '30m', '1h', '4h', '1d'];
 
+// Symbol-specific configuration (Requirement10)
+export const DEFAULT_CONFIG = {
+  adxThreshold: 20,         // ADX threshold to confirm trend
+  atrMultiplier: 0.2,       // ATR multiplier for SL offset from swing
+  maZoneAtp: 0.004,         // % distance to MA50 to consider "touch"
+  rsiBuyRange: [50, 65],
+  rsiSellRange: [35, 50],
+  swingLookback: 5,
+};
+
+export const SYMBOL_CONFIGS = {
+  BTCUSDT: { ...DEFAULT_CONFIG },
+  ETHUSDT: { ...DEFAULT_CONFIG },
+};
+
+function getSymbolConfig(symbol, symbolConfigsOverride = null) {
+  const key = String(symbol ?? '').toUpperCase();
+  const src = (symbolConfigsOverride && typeof symbolConfigsOverride === 'object') ? symbolConfigsOverride : null;
+  return src?.[key] ?? SYMBOL_CONFIGS[key] ?? DEFAULT_CONFIG;
+}
+
 export function last(arr) {
   return arr?.length ? arr[arr.length - 1] : null;
 }
