@@ -514,7 +514,7 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
   };
 }
 
-function buildSltpPullbackToMa({ bias, entry, candles1h, atrMultiplier = null }) {
+function buildSltpPullbackToMa({ bias, entry, candles1h, atrMultiplier = null, swingLookback = 5 }) {
   // New SL/TP logic (per requirement):
   // - Use swing low/high of last 5 candles on 1H
   // - SL = swing +/- 0.2*ATR(1H)
@@ -539,13 +539,13 @@ function buildSltpPullbackToMa({ bias, entry, candles1h, atrMultiplier = null })
   const swingHigh = Math.max(...swingSlice.map(c => Number(c.high)).filter(Number.isFinite));
   if (!Number.isFinite(swingLow) || !Number.isFinite(swingHigh)) return { ok: false, reason: 'SWING_INVALID' };
 
-  const trail = 0.2 * atr1h;
+  // Replace hardcoded 0.2 ATR offset with config.atrMultiplier (Requirement10)
+  const mult = atrMultiplier == null ? DEFAULT_CONFIG.atrMultiplier : Number(atrMultiplier);
+  const useMult = Number.isFinite(mult) ? Math.max(0.01, Math.min(mult, 10)) : DEFAULT_CONFIG.atrMultiplier;
+  const trail = useMult * atr1h;
 
-  // Dynamic ATR multiplier for SL breathing room (Requirement):
-  // Suggested: BTC=1.5, ETH=2.5
-  const mult = atrMultiplier == null ? 1.5 : Number(atrMultiplier);
-  const useMult = Number.isFinite(mult) ? Math.max(0.5, Math.min(mult, 10)) : 1.5;
-  const force = useMult * atr1h;
+  // Keep the legacy force fallback for safety
+  const force = 1.5 * atr1h;
 
   let sl, tp, dist;
 
