@@ -64,21 +64,22 @@ async function main() {
     warmupMs,
   });
 
-  // Optional: BTC context (for correlation filter when backtesting alts)
-  let btcData = null;
+  // Optional: BTC 1H context (for correlation filter when backtesting alts)
+  let btcCandles1h = null;
   let btcIndicatorsFromDb = true;
   let btcTableName = null;
 
   if (String(symbol).toUpperCase() !== 'BTCUSDT') {
     const btcRes = await loadCandlesMultiTf({
       symbol: 'BTCUSDT',
-      intervals: INTERVALS,
+      intervals: ['1h'],
       startTime,
       endTime,
       warmupMs,
       tableNameOverride: 'candles_btc',
     });
-    btcData = btcRes.data;
+
+    btcCandles1h = btcRes.data?.['1h'] ?? null;
     btcIndicatorsFromDb = btcRes.indicatorsFromDb;
     btcTableName = btcRes.tableName;
   }
@@ -104,7 +105,7 @@ async function main() {
     slippagePct,
     data,
     indicatorsFromDb,
-    btcData,
+    btcCandles1h,
     btcIndicatorsFromDb,
     debug,
   });

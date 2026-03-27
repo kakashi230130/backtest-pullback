@@ -131,10 +131,10 @@ export function runBacktest({
   const ptr = {};
   for (const itv of INTERVALS) ptr[itv] = 0;
 
-  const btcPtr = {};
-  if (btcData) {
-    for (const itv of INTERVALS) btcPtr[itv] = 0;
-  }
+  // BTC 1H map (open_time -> candle)
+  const btcMap = btcCandles1h
+    ? new Map(btcCandles1h.map(c => [Number(c.open_time), c]))
+    : null;
 
   let i0 = candles5.findIndex(c => c.open_time >= start);
   if (i0 < 0) i0 = candles5.length;
@@ -203,18 +203,14 @@ export function runBacktest({
       snapData[itv] = arr.slice(0, p);
     }
 
-    // Optional BTC context sync (for correlation filter)
-    const btcSnapData = btcData ? {} : null;
-    if (btcData) {
-      for (const itv of INTERVALS) {
-        const arr = btcData[itv] ?? [];
-        const tfMs = msForInterval(itv);
-        let p = btcPtr[itv];
-        while (p < arr.length && (arr[p].open_time + tfMs) <= nowMs) p++;
-        btcPtr[itv] = p;
-        btcSnapData[itv] = arr.slice(0, p);
-      }
-    }
+    // BTC context matching (Requirement):
+    // Symbol main loop runs on 5m/15m, but BTC context is fixed at 1h.
+    // We match BTC candle by hour bucket of the *current* 15m candle.
+    const c15Now = snapData['15m']?.at(-1) ?? null;
+    const btcHourTimestamp = c15Now?.open_time != null
+      ? Math.floor(Number(c15Now.open_time) / 3600000) * 3600000
+      : null;
+    const btcContext = (btcMap && btcHourTimestamp != null) ? (btcMap.get(btcHourTimestamp) ?? null) : null;
 
     // Fill pending limit (option B)
     if (pending) {
@@ -493,8 +489,8 @@ export function runBacktest({
 
     // Analyze + open new pending
     if (!open && !pending) {
-      const btcContext = btcSnapData ? (btcSnapData['1h']?.at(-1) ?? null) : null;
-      const analysis = analyzeSymbolFromCandles({ symbol, data: snapData, nowMs, btcContext });
+      const requireBtcContext = String(symbol).toUpperCase() !== 'BTCUSDT';
+      const analysis = analyzeSymbolFromCandles({ symbol, data: snapData, nowMs, btcContext, requireBtcContext });
       if (!analysis) {
         debugStats.analysis_null += 1;
       } else {
