@@ -105,8 +105,8 @@ export function runBacktest({
   slippagePct = 0,
   data,
   indicatorsFromDb = true,
-  // Optional BTC context (for correlation filter when backtesting alts)
-  btcData = null, // same shape as `data`: { '5m': [...], '15m': [...], ... }
+  // Optional BTC 1H context candles (for correlation filter when backtesting alts)
+  btcCandles1h = null,
   btcIndicatorsFromDb = true,
   debug = false,
 }) {
@@ -118,10 +118,8 @@ export function runBacktest({
     }
   }
 
-  if (btcData && !btcIndicatorsFromDb) {
-    for (const itv of Object.keys(btcData)) {
-      addIndicatorsToCandleRows(btcData[itv]);
-    }
+  if (btcCandles1h && !btcIndicatorsFromDb) {
+    addIndicatorsToCandleRows(btcCandles1h);
   }
 
   const candles5 = data['5m'] ?? [];
