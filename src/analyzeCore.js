@@ -14,7 +14,15 @@ export const DEFAULT_CONFIG = {
 
 export const SYMBOL_CONFIGS = {
   BTCUSDT: { ...DEFAULT_CONFIG },
-  ETHUSDT: { ...DEFAULT_CONFIG },
+  ETHUSDT: {
+    // ETH-specific optimization (Requirement9)
+    adxThreshold: 25,
+    atrMultiplier: 0.8,
+    maZoneAtp: 0.001, // 0.1%
+    rsiBuyRange: [52, 70],
+    rsiSellRange: [30, 48],
+    swingLookback: 10,
+  },
 };
 
 function getSymbolConfig(symbol, symbolConfigsOverride = null) {
@@ -746,18 +754,38 @@ export function analyzeSymbolFromCandles(...args) {
         const atrMultiplier = cfg?.atrMultiplier ?? DEFAULT_CONFIG.atrMultiplier;
         const swingLookback = cfg?.swingLookback ?? DEFAULT_CONFIG.swingLookback;
 
-        const sltp = buildSltpPullbackToMa({ bias, entry, candles1h: data['1h'], atrMultiplier, swingLookback });
-        if (sltp?.ok) {
-          setup = {
-            action: bias,
-            entry,
-            sl: sltp.sl,
-            tp: sltp.tp,
-            rr: sltp.rr,
-            reasons: { entryCheck, sltpMeta: sltp.meta },
-          };
-        } else {
-          entryCheck = { ok: false, reason: sltp?.reason ?? 'SLTP_FAIL', details: sltp ?? null };
+        // ETH-specific 5m impulse confirmation (Requirement9)
+        // Confirm the 5m candle body is at least +15% vs previous candle (momentum back to trend).
+        if (String(symbol).toUpperCase() === 'ETHUSDT') {
+          const c5Now = last(data['5m']);
+          const c5Prev = data['5m']?.at(-2) ?? null;
+          const pNow = candleParts(c5Now);
+          const pPrev = candleParts(c5Prev);
+          if (!pNow || !pPrev || !(pPrev.body > 0)) {
+            entryCheck = { ok: false, reason: 'WEAK_CONFIRM_CANDLE', details: { tf: '5m', why: 'NO_PREV_BODY' } };
+          } else {
+            const need = pPrev.body * 1.15;
+            const dirOk = bias === 'BUY' ? (pNow.close > pNow.open) : (pNow.close < pNow.open);
+            if (!dirOk || !(pNow.body >= need)) {
+              entryCheck = { ok: false, reason: 'WEAK_CONFIRM_CANDLE', details: { tf: '5m', dir: bias, curBody: pNow.body, prevBody: pPrev.body, need } };
+            }
+          }
+        }
+
+        if (entryCheck.ok) {
+          const sltp = buildSltpPullbackToMa({ bias, entry, candles1h: data['1h'], atrMultiplier, swingLookback });
+          if (sltp?.ok) {
+            setup = {
+              action: bias,
+              entry,
+              sl: sltp.sl,
+              tp: sltp.tp,
+              rr: sltp.rr,
+              reasons: { entryCheck, sltpMeta: sltp.meta },
+            };
+          } else {
+            entryCheck = { ok: false, reason: sltp?.reason ?? 'SLTP_FAIL', details: sltp ?? null };
+          }
         }
       } else {
         entryCheck = { ok: false, reason: 'MISSING_15M' };
