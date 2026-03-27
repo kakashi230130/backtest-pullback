@@ -1,5 +1,23 @@
 import { pool } from './db.js';
 
+function normSymbol(s) {
+  const x = String(s ?? '').toUpperCase().trim();
+  if (!x) return '';
+  // Allow both spot-like and shorthand symbols
+  if (x === 'BTC') return 'BTCUSDT';
+  if (x === 'ETH') return 'ETHUSDT';
+  return x;
+}
+
+// Map symbol to the underlying candle table.
+// IMPORTANT: This whitelist prevents SQL injection because tableName is not parameterizable.
+export function resolveCandleTable(symbol) {
+  const sym = normSymbol(symbol);
+  if (sym === 'BTCUSDT') return 'candles_btc';
+  if (sym === 'ETHUSDT') return 'candles_eth';
+  throw new Error(`Unsupported symbol for candle table mapping: ${symbol}`);
+}
+
 export function mapKline(symbol, interval, k) {
   return {
     symbol,
@@ -23,8 +41,11 @@ export function mapKline(symbol, interval, k) {
   };
 }
 
-export async function upsertCandles(rows) {
+export async function upsertCandles(rows, { tableName = null } = {}) {
   if (!rows.length) return { insertedOrUpdated: 0 };
+
+  // If tableName not provided, infer from first row symbol.
+  const tn = tableName ?? resolveCandleTable(rows[0]?.symbol);
 
   const cols = [
     'symbol',
@@ -50,7 +71,7 @@ export async function upsertCandles(rows) {
   const values = rows.map(r => cols.map(c => r[c]));
 
   const sql = `
-    INSERT INTO candles (${cols.join(',')})
+    INSERT INTO ${tn} (${cols.join(',')})
     VALUES ${values.map(() => `(${cols.map(() => '?').join(',')})`).join(',')}
     ON DUPLICATE KEY UPDATE
       open=VALUES(open),
@@ -75,11 +96,13 @@ export async function upsertCandles(rows) {
   return { insertedOrUpdated: result.affectedRows ?? 0 };
 }
 
-export async function getRecentClosesBefore(symbol, interval, beforeOpenTime, limit = 250) {
+export async function getRecentClosesBefore(symbol, interval, beforeOpenTime, limit = 250, { tableName = null } = {}) {
+  const tn = tableName ?? resolveCandleTable(symbol);
+
   const [rows] = await pool.query(
     `
     SELECT open_time, close
-    FROM candles
+    FROM ${tn}
     WHERE symbol=:symbol
       AND interval_code=:interval
       AND open_time < :beforeOpenTime

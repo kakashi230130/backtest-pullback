@@ -1,4 +1,5 @@
 import { pool } from './db.js';
+import { resolveCandleTable } from './candlesRepo.js';
 
 function normalizeInterval(itv) {
   const x = String(itv);
@@ -12,15 +13,17 @@ function toNum(x) {
   return Number.isFinite(n) ? n : null;
 }
 
-async function queryCandles({ symbol, interval, startTime, endTime, includeIndicators }) {
+async function queryCandles({ symbol, interval, startTime, endTime, includeIndicators, tableName = null }) {
   const colsBase = 'open_time, open, high, low, close, volume';
   const colsInd = 'rsi, ma20, ma50, ma200';
   const cols = includeIndicators ? `${colsBase}, ${colsInd}` : colsBase;
 
+  const tn = tableName ?? resolveCandleTable(symbol);
+
   const [rows] = await pool.query(
     `
     SELECT ${cols}
-    FROM candles
+    FROM ${tn}
     WHERE symbol=:symbol
       AND interval_code=:interval
       AND open_time>=:startTime
@@ -44,7 +47,9 @@ async function queryCandles({ symbol, interval, startTime, endTime, includeIndic
   }));
 }
 
-export async function loadCandlesMultiTf({ symbol, intervals, startTime, endTime, warmupMs = 0 }) {
+// Load candles for multiple timeframes.
+// - tableNameOverride: force a specific candles table (used for correlation / cross-reference).
+export async function loadCandlesMultiTf({ symbol, intervals, startTime, endTime, warmupMs = 0, tableNameOverride = null }) {
   const start = Number(startTime) - Number(warmupMs || 0);
   const end = Number(endTime);
 
@@ -54,9 +59,9 @@ export async function loadCandlesMultiTf({ symbol, intervals, startTime, endTime
   try {
     for (const itv0 of intervals) {
       const interval = normalizeInterval(itv0);
-      out[interval] = await queryCandles({ symbol, interval, startTime: start, endTime: end, includeIndicators });
+      out[interval] = await queryCandles({ symbol, interval, startTime: start, endTime: end, includeIndicators, tableName: tableNameOverride });
     }
-    return { data: out, indicatorsFromDb: true };
+    return { data: out, indicatorsFromDb: true, tableName: tableNameOverride ?? resolveCandleTable(symbol) };
   } catch (err) {
     const msg = String(err?.message ?? '');
     const code = err?.code;
@@ -65,9 +70,9 @@ export async function loadCandlesMultiTf({ symbol, intervals, startTime, endTime
       for (const k of Object.keys(out)) delete out[k];
       for (const itv0 of intervals) {
         const interval = normalizeInterval(itv0);
-        out[interval] = await queryCandles({ symbol, interval, startTime: start, endTime: end, includeIndicators });
+        out[interval] = await queryCandles({ symbol, interval, startTime: start, endTime: end, includeIndicators, tableName: tableNameOverride });
       }
-      return { data: out, indicatorsFromDb: false };
+      return { data: out, indicatorsFromDb: false, tableName: tableNameOverride ?? resolveCandleTable(symbol) };
     }
     throw err;
   }

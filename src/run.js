@@ -56,13 +56,20 @@ async function main() {
 
   const warmupMs = Number(args.warmup_ms ?? process.env.BACKTEST_WARMUP_MS ?? (7 * 24 * 60 * 60 * 1000));
 
-  const { data, indicatorsFromDb } = await loadCandlesMultiTf({
+  const { data, indicatorsFromDb, tableName } = await loadCandlesMultiTf({
     symbol,
     intervals: INTERVALS,
     startTime,
     endTime,
     warmupMs,
   });
+
+  // Debug: log which candle table is used for this backtest run
+  console.log(JSON.stringify({
+    info: 'BACKTEST_TABLE_SELECTION',
+    symbol,
+    tableName,
+  }, null, 2));
 
   const debug = String(args.debug ?? process.env.BACKTEST_DEBUG ?? '0') === '1';
 
