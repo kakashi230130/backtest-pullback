@@ -493,7 +493,7 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
   };
 }
 
-function buildSltpPullbackToMa({ bias, entry, candles1h }) {
+function buildSltpPullbackToMa({ bias, entry, candles1h, atrMultiplier = null }) {
   // New SL/TP logic (per requirement):
   // - Use swing low/high of last 5 candles on 1H
   // - SL = swing +/- 0.2*ATR(1H)
@@ -519,7 +519,12 @@ function buildSltpPullbackToMa({ bias, entry, candles1h }) {
   if (!Number.isFinite(swingLow) || !Number.isFinite(swingHigh)) return { ok: false, reason: 'SWING_INVALID' };
 
   const trail = 0.2 * atr1h;
-  const force = 1.5 * atr1h;
+
+  // Dynamic ATR multiplier for SL breathing room (Requirement):
+  // Suggested: BTC=1.5, ETH=2.5
+  const mult = atrMultiplier == null ? 1.5 : Number(atrMultiplier);
+  const useMult = Number.isFinite(mult) ? Math.max(0.5, Math.min(mult, 10)) : 1.5;
+  const force = useMult * atr1h;
 
   let sl, tp, dist;
 
@@ -552,7 +557,7 @@ function buildSltpPullbackToMa({ bias, entry, candles1h }) {
       swingHigh,
       swingBars: nSwing,
       slTrailAtr: 0.2,
-      slForceAtr: 1.5,
+      slForceAtr: useMult,
     },
   };
 }
@@ -613,7 +618,7 @@ function recentSwingHigh(candles, lookback = 20) {
   return Math.max(...slice.map(c => c.high));
 }
 
-export function analyzeSymbolFromCandles({ symbol, data, nowMs, btcContext = null, requireBtcContext = false }) {
+export function analyzeSymbolFromCandles({ symbol, data, nowMs, btcContext = null, requireBtcContext = false, symbolConfigs = null }) {
   const c5 = last(data['5m']);
 
   const maxStalenessMs = Number(process.env.MAX_CANDLE_STALENESS_MS ?? 15 * 60 * 1000);
@@ -648,25 +653,59 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs, btcContext = nul
 
   let bias = htfTrend === 'BULL' ? 'BUY' : (htfTrend === 'BEAR' ? 'SELL' : 'WAIT');
 
+  // ADX regime filter (Requirement): only allow BUY/SELL bias when ADX(14) on 1H > 25.
+  // This helps avoid sideways/choppy regimes.
+  const adxMinBias = Number(process.env.ADX_MIN_BIAS_LEVEL ?? 25);
+  const arr1h = data['1h'] ?? [];
+  if (bias !== 'WAIT') {
+    if (arr1h.length < 40) {
+      // Not enough bars to compute a reliable ADX → be conservative.
+      bias = 'WAIT';
+    } else {
+      const highs1h = arr1h.map(c => c.high);
+      const lows1h = arr1h.map(c => c.low);
+      const closes1h = arr1h.map(c => c.close);
+      const adx1hArr = calcAdx(highs1h, lows1h, closes1h, 14);
+      const adx1hNow = adx1hArr[adx1hArr.length - 1];
+      if (!(adx1hNow > adxMinBias)) {
+        bias = 'WAIT';
+      }
+    }
+  }
+
   // Entry check
   let entryCheck = { ok: false, reason: 'BIAS_WAIT' };
   let setup = null;
 
+  // If HTF trend says BUY/SELL but bias got nulled by ADX regime, mark explicit reason.
+  if (htfTrend !== 'NEUTRAL' && bias === 'WAIT') {
+    entryCheck = { ok: false, reason: 'WEAK_TREND_ADX' };
+  }
+
   if (strategy === 'PULLBACK_TO_MA') {
-    entryCheck = isEntrySignalPullbackToMa({
-      bias,
-      candles15: data['15m'],
-      candles1h: data['1h'],
-      candles4h: data['4h'],
-      candles1d: data['1d'],
-      btcContext,
-      requireBtcContext,
-    });
+    // Only run the expensive entry checks if bias is BUY/SELL.
+    if (bias === 'WAIT') {
+      // keep the reason as-is (BIAS_WAIT or WEAK_TREND_ADX)
+    } else {
+      entryCheck = isEntrySignalPullbackToMa({
+        bias,
+        candles15: data['15m'],
+        candles1h: data['1h'],
+        candles4h: data['4h'],
+        candles1d: data['1d'],
+        btcContext,
+        requireBtcContext,
+      });
+    }
 
     if (bias !== 'WAIT' && entryCheck.ok) {
       const entry = c15?.close;
       if (entry != null) {
-        const sltp = buildSltpPullbackToMa({ bias, entry, candles1h: data['1h'] });
+        const symKey = String(symbol ?? '').toUpperCase();
+        const cfg = symbolConfigs && typeof symbolConfigs === 'object' ? symbolConfigs[symKey] : null;
+        const atrMultiplier = cfg?.atrMultiplier ?? null;
+
+        const sltp = buildSltpPullbackToMa({ bias, entry, candles1h: data['1h'], atrMultiplier });
         if (sltp?.ok) {
           setup = {
             action: bias,

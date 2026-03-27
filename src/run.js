@@ -94,6 +94,11 @@ async function main() {
 
   const debug = String(args.debug ?? process.env.BACKTEST_DEBUG ?? '0') === '1';
 
+  const symbolConfigs = {
+    BTCUSDT: { atrMultiplier: 1.5 },
+    ETHUSDT: { atrMultiplier: 2.5 },
+  };
+
   const result = runBacktest({
     symbol,
     startTime,
@@ -105,6 +110,7 @@ async function main() {
     slippagePct,
     data,
     indicatorsFromDb,
+    symbolConfigs,
     btcCandles1h,
     btcIndicatorsFromDb,
     debug,

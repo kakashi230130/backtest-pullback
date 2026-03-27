@@ -105,6 +105,8 @@ export function runBacktest({
   slippagePct = 0,
   data,
   indicatorsFromDb = true,
+  // Optional per-symbol configuration (e.g., ATR multiplier)
+  symbolConfigs = null,
   // Optional BTC 1H context candles (for correlation filter when backtesting alts)
   btcCandles1h = null,
   btcIndicatorsFromDb = true,
@@ -209,8 +211,8 @@ export function runBacktest({
     //   ? Math.floor(Number(c15Now.open_time) / 3600000) * 3600000
     //   : null;
     // const btcContext = (btcMap && btcHourTimestamp != null) ? (btcMap.get(btcHourTimestamp) ?? null) : null;
-    const lastClosedHourStart = Math.floor(nowMs / 3600000) * 3600000 - 3600000;
-    const btcContext = btcMap ? (btcMap.get(lastClosedHourStart) ?? null) : null;
+    const lastClosedHour = Math.floor(Number(nowMs) / 3600000) * 3600000 - 3600000;
+    const btcContext = (btcMap && Number.isFinite(lastClosedHour)) ? (btcMap.get(lastClosedHour) ?? null) : null;
 
     // Fill pending limit (option B)
     if (pending) {
@@ -490,7 +492,7 @@ export function runBacktest({
     // Analyze + open new pending
     if (!open && !pending) {
       const requireBtcContext = String(symbol).toUpperCase() !== 'BTCUSDT';
-      const analysis = analyzeSymbolFromCandles({ symbol, data: snapData, nowMs, btcContext, requireBtcContext });
+      const analysis = analyzeSymbolFromCandles({ symbol, data: snapData, nowMs, btcContext, requireBtcContext, symbolConfigs });
       if (!analysis) {
         debugStats.analysis_null += 1;
       } else {
