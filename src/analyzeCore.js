@@ -353,10 +353,18 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
   if (bias !== 'BUY' && bias !== 'SELL') return { ok: false, reason: 'BIAS_WAIT' };
 
   const maZonePct = Number(process.env.PULLBACK_MA_ZONE_PCT ?? 0.004);
-  const rsi1hBullMin = Number(process.env.PULLBACK_RSI1H_BULL_MIN ?? 35);
-  const rsi1hBullMax = Number(process.env.PULLBACK_RSI1H_BULL_MAX ?? 55);
-  const rsi1hBearMin = Number(process.env.PULLBACK_RSI1H_BEAR_MIN ?? 45);
-  const rsi1hBearMax = Number(process.env.PULLBACK_RSI1H_BEAR_MAX ?? 65);
+
+  // RSI 1H filter (Requirement):
+  // - BUY only when RSI(14) on 1H is in [50, 65]
+  // - SELL only when RSI(14) on 1H is in [35, 50]
+  // Optional env overrides (easy tuning):
+  // - RSI_BUY_LOW / RSI_BUY_HIGH
+  // - RSI_SELL_LOW / RSI_SELL_HIGH
+  const rsiBuyLow = Number(process.env.RSI_BUY_LOW ?? 50);
+  const rsiBuyHigh = Number(process.env.RSI_BUY_HIGH ?? 65);
+  const rsiSellLow = Number(process.env.RSI_SELL_LOW ?? 35);
+  const rsiSellHigh = Number(process.env.RSI_SELL_HIGH ?? 50);
+
   const volMult = Number(process.env.PULLBACK_VOLUME_MULT ?? 1.3);
   const minRr = Number(process.env.PULLBACK_MIN_RR ?? 1.8);
   const requireConfirm = (process.env.PULLBACK_REQUIRE_CONFIRM ?? '1') === '1';
@@ -398,13 +406,18 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
   const closes1h = candles1h.map(c => c.close);
   const rsiArr1h = calcRsi(closes1h, 14);
   const rsi1h = rsiArr1h[rsiArr1h.length - 1];
-  if (rsi1h == null) return { ok: false, reason: 'NO_RSI_1H' };
+  if (rsi1h == null) return { ok: false, reason: 'NO_RSI_1H', debug: { rsi1h: null } };
 
   let rsiOk = false;
-  if (bias === 'BUY' && rsi1h >= rsi1hBullMin && rsi1h <= rsi1hBullMax) rsiOk = true;
-  if (bias === 'SELL' && rsi1h >= rsi1hBearMin && rsi1h <= rsi1hBearMax) rsiOk = true;
+  if (bias === 'BUY' && rsi1h >= rsiBuyLow && rsi1h <= rsiBuyHigh) rsiOk = true;
+  if (bias === 'SELL' && rsi1h >= rsiSellLow && rsi1h <= rsiSellHigh) rsiOk = true;
   if (!rsiOk) {
-    return { ok: false, reason: 'RSI_OUT_OF_ZONE', details: { rsi1h, bias, rsi1hBullMin, rsi1hBullMax, rsi1hBearMin, rsi1hBearMax } };
+    return {
+      ok: false,
+      reason: 'RSI_OUT_OF_ZONE',
+      details: { rsi1h, bias, rsiBuyLow, rsiBuyHigh, rsiSellLow, rsiSellHigh },
+      debug: { rsi1h },
+    };
   }
 
   // Step 4: confirmation candle on 15m
@@ -419,7 +432,13 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
   if (!volResult.ok) return { ok: false, reason: 'VOLUME_FILTER', details: volResult };
 
   // RR filter is enforced in SLTP builder; keep minRr for reporting
-  return { ok: true, mode: 'PULLBACK_TO_MA', details: { whichMA, rsi1h, confirmResult, volResult, minRr } };
+  return {
+    ok: true,
+    mode: 'PULLBACK_TO_MA',
+    details: { whichMA, rsi1h, confirmResult, volResult, minRr },
+    // Requirement: keep RSI in debug so it shows up in backtest result logs.
+    debug: { rsi1h },
+  };
 }
 
 function buildSltpPullbackToMa({ bias, entry, candles1h }) {
