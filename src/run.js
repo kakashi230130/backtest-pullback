@@ -64,11 +64,31 @@ async function main() {
     warmupMs,
   });
 
+  // Optional: BTC context (for correlation filter when backtesting alts)
+  let btcData = null;
+  let btcIndicatorsFromDb = true;
+  let btcTableName = null;
+
+  if (String(symbol).toUpperCase() !== 'BTCUSDT') {
+    const btcRes = await loadCandlesMultiTf({
+      symbol: 'BTCUSDT',
+      intervals: INTERVALS,
+      startTime,
+      endTime,
+      warmupMs,
+      tableNameOverride: 'candles_btc',
+    });
+    btcData = btcRes.data;
+    btcIndicatorsFromDb = btcRes.indicatorsFromDb;
+    btcTableName = btcRes.tableName;
+  }
+
   // Debug: log which candle table is used for this backtest run
   console.log(JSON.stringify({
     info: 'BACKTEST_TABLE_SELECTION',
     symbol,
     tableName,
+    btcTableName,
   }, null, 2));
 
   const debug = String(args.debug ?? process.env.BACKTEST_DEBUG ?? '0') === '1';
@@ -84,6 +104,8 @@ async function main() {
     slippagePct,
     data,
     indicatorsFromDb,
+    btcData,
+    btcIndicatorsFromDb,
     debug,
   });
 

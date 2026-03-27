@@ -105,6 +105,9 @@ export function runBacktest({
   slippagePct = 0,
   data,
   indicatorsFromDb = true,
+  // Optional BTC context (for correlation filter when backtesting alts)
+  btcData = null, // same shape as `data`: { '5m': [...], '15m': [...], ... }
+  btcIndicatorsFromDb = true,
   debug = false,
 }) {
   if (!symbol) throw new Error('symbol required');
@@ -115,12 +118,23 @@ export function runBacktest({
     }
   }
 
+  if (btcData && !btcIndicatorsFromDb) {
+    for (const itv of Object.keys(btcData)) {
+      addIndicatorsToCandleRows(btcData[itv]);
+    }
+  }
+
   const candles5 = data['5m'] ?? [];
   const start = Number(startTime);
   const end = Number(endTime);
 
   const ptr = {};
   for (const itv of INTERVALS) ptr[itv] = 0;
+
+  const btcPtr = {};
+  if (btcData) {
+    for (const itv of INTERVALS) btcPtr[itv] = 0;
+  }
 
   let i0 = candles5.findIndex(c => c.open_time >= start);
   if (i0 < 0) i0 = candles5.length;
@@ -187,6 +201,19 @@ export function runBacktest({
       while (p < arr.length && (arr[p].open_time + tfMs) <= nowMs) p++;
       ptr[itv] = p;
       snapData[itv] = arr.slice(0, p);
+    }
+
+    // Optional BTC context sync (for correlation filter)
+    const btcSnapData = btcData ? {} : null;
+    if (btcData) {
+      for (const itv of INTERVALS) {
+        const arr = btcData[itv] ?? [];
+        const tfMs = msForInterval(itv);
+        let p = btcPtr[itv];
+        while (p < arr.length && (arr[p].open_time + tfMs) <= nowMs) p++;
+        btcPtr[itv] = p;
+        btcSnapData[itv] = arr.slice(0, p);
+      }
     }
 
     // Fill pending limit (option B)
@@ -466,7 +493,8 @@ export function runBacktest({
 
     // Analyze + open new pending
     if (!open && !pending) {
-      const analysis = analyzeSymbolFromCandles({ symbol, data: snapData, nowMs });
+      const btcContext = btcSnapData ? (btcSnapData['1h']?.at(-1) ?? null) : null;
+      const analysis = analyzeSymbolFromCandles({ symbol, data: snapData, nowMs, btcContext });
       if (!analysis) {
         debugStats.analysis_null += 1;
       } else {

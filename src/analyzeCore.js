@@ -349,7 +349,7 @@ function volumeOk15m(candles, mult = 1.3, lookback = 20) {
   return { ok: curVol >= avg * mult, curVol, avg, mult };
 }
 
-function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, candles1d }) {
+function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, candles1d, btcContext = null }) {
   if (bias !== 'BUY' && bias !== 'SELL') return { ok: false, reason: 'BIAS_WAIT' };
 
   const maZonePct = Number(process.env.PULLBACK_MA_ZONE_PCT ?? 0.004);
@@ -402,6 +402,24 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
     return { ok: false, reason: 'BEAR_PRICE_ABOVE_MA50' };
   }
 
+  // Step 2c: BTC market regime / correlation filter (Requirement)
+  // When backtesting an alt (e.g., ETH), only allow entries if BTC agrees on 1H MA50 regime.
+  // - BUY:  BTC close must be above BTC MA50 (1H)
+  // - SELL: BTC close must be below BTC MA50 (1H)
+  if (btcContext) {
+    const btcPrice = Number(btcContext.close);
+    const btcMa50 = Number(btcContext.ma50);
+
+    if (!Number.isFinite(btcPrice) || !Number.isFinite(btcMa50)) {
+      return { ok: false, reason: 'btc_correlation_fail', debug: { btc_price: btcPrice, btc_ma50: btcMa50 } };
+    }
+
+    const ok = bias === 'BUY' ? (btcPrice > btcMa50) : (btcPrice < btcMa50);
+    if (!ok) {
+      return { ok: false, reason: 'btc_correlation_fail', debug: { btc_price: btcPrice, btc_ma50: btcMa50 } };
+    }
+  }
+
   // Step 3: ADX 1H filter (Requirement)
   // Only trade when trend strength is clear: ADX(14) on 1H must be >= threshold.
   const adxMin = Number(process.env.ADX_MIN_LEVEL ?? 25);
@@ -411,15 +429,19 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
   const adxArr1h = calcAdx(highs1h, lows1h, closes1h, 14);
   const adx1h = adxArr1h[adxArr1h.length - 1];
 
-  if (adx1h == null) return { ok: false, reason: 'NO_ADX_1H', debug: { adx1h: null } };
+  const btcDebug = btcContext
+    ? { btc_price: Number(btcContext.close), btc_ma50: Number(btcContext.ma50) }
+    : null;
+
+  if (adx1h == null) return { ok: false, reason: 'NO_ADX_1H', debug: { adx1h: null, ...(btcDebug ?? {}) } };
   if (adx1h < adxMin) {
-    return { ok: false, reason: 'adx_weak_trend', debug: { adx1h, adxMin } };
+    return { ok: false, reason: 'adx_weak_trend', debug: { adx1h, adxMin, ...(btcDebug ?? {}) } };
   }
 
   // Step 4: RSI 1H zone (recomputed from closes)
   const rsiArr1h = calcRsi(closes1h, 14);
   const rsi1h = rsiArr1h[rsiArr1h.length - 1];
-  if (rsi1h == null) return { ok: false, reason: 'NO_RSI_1H', debug: { rsi1h: null, adx1h } };
+  if (rsi1h == null) return { ok: false, reason: 'NO_RSI_1H', debug: { rsi1h: null, adx1h, ...(btcDebug ?? {}) } };
 
   let rsiOk = false;
   if (bias === 'BUY' && rsi1h >= rsiBuyLow && rsi1h <= rsiBuyHigh) rsiOk = true;
@@ -429,7 +451,7 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
       ok: false,
       reason: 'RSI_OUT_OF_ZONE',
       details: { rsi1h, bias, rsiBuyLow, rsiBuyHigh, rsiSellLow, rsiSellHigh },
-      debug: { rsi1h, adx1h },
+      debug: { rsi1h, adx1h, ...(btcDebug ?? {}) },
     };
   }
 
@@ -450,7 +472,7 @@ function isEntrySignalPullbackToMa({ bias, candles15, candles1h, candles4h, cand
     mode: 'PULLBACK_TO_MA',
     details: { whichMA, rsi1h, confirmResult, volResult, minRr },
     // Requirement: keep RSI in debug so it shows up in backtest result logs.
-    debug: { rsi1h, adx1h },
+    debug: { rsi1h, adx1h, ...(btcDebug ?? {}) },
   };
 }
 
@@ -574,7 +596,7 @@ function recentSwingHigh(candles, lookback = 20) {
   return Math.max(...slice.map(c => c.high));
 }
 
-export function analyzeSymbolFromCandles({ symbol, data, nowMs }) {
+export function analyzeSymbolFromCandles({ symbol, data, nowMs, btcContext = null }) {
   const c5 = last(data['5m']);
 
   const maxStalenessMs = Number(process.env.MAX_CANDLE_STALENESS_MS ?? 15 * 60 * 1000);
@@ -614,7 +636,14 @@ export function analyzeSymbolFromCandles({ symbol, data, nowMs }) {
   let setup = null;
 
   if (strategy === 'PULLBACK_TO_MA') {
-    entryCheck = isEntrySignalPullbackToMa({ bias, candles15: data['15m'], candles1h: data['1h'], candles4h: data['4h'], candles1d: data['1d'] });
+    entryCheck = isEntrySignalPullbackToMa({
+      bias,
+      candles15: data['15m'],
+      candles1h: data['1h'],
+      candles4h: data['4h'],
+      candles1d: data['1d'],
+      btcContext,
+    });
 
     if (bias !== 'WAIT' && entryCheck.ok) {
       const entry = c15?.close;
