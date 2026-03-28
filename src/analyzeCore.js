@@ -16,12 +16,12 @@ export const SYMBOL_CONFIGS = {
   BTCUSDT: { ...DEFAULT_CONFIG },
   ETHUSDT: {
     // ETH-specific optimization (Requirement9)
-    adxThreshold: 25,
-    atrMultiplier: 0.8,
-    maZoneAtp: 0.001, // 0.1%
-    rsiBuyRange: [52, 70],
-    rsiSellRange: [30, 48],
-    swingLookback: 10,
+    adxThreshold: 20,         // ADX threshold to confirm trend
+    atrMultiplier: 0.15,       // ATR multiplier for SL offset from swing
+    maZoneAtp: 0.004,         // % distance to MA50 to consider "touch"
+    rsiBuyRange: [50, 65],
+    rsiSellRange: [35, 50],
+    swingLookback: 3,
   },
 };
 
